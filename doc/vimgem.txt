@@ -1,7 +1,7 @@
 *vimgem.txt* *vimgem*    Multi-provider AI assistant for Vim
 
 
-                VIMGEM REFERENCE MANUAL 0.1.260825
+                VIMGEM REFERENCE MANUAL 0.1.260827
                         by Russ Tremain
 
         Query, chat with, or have code reviewed by an AI model

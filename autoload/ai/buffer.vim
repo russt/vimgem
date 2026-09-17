@@ -1,4 +1,4 @@
-"use vim9 script only:
+"use vim9script only:
 vim9script
 
 # autoload/ai/buffer.vim
@@ -158,7 +158,13 @@ export class AIBuffer
     # json_readable.txt loaded), the new content fully replaces the old
     # rather than leaving stale lines from a longer previous render
     # visible past the end of the new one.
-    def DisplayText(lines: list<string>, filetype: string = 'text', bufname: string = '')
+    #
+    # source_chat_id, when non-empty, is stored as b:ai_source_chat_id
+    # on the scratch buffer. This lets :AIModel called from a models
+    # list buffer (opened via :AIModels from a chat context) find and
+    # update the originating chat session snapshot, even though the
+    # models buffer itself is not a registered chat buffer.
+    def DisplayText(lines: list<string>, filetype: string = 'text', bufname: string = '', source_chat_id: string = '', cursor: string = 'bottom')
         # If a buffer with this name is already open and visible in a
         # window, jump to that window and replace its content in place
         # rather than opening a new split.
@@ -187,7 +193,18 @@ export class AIBuffer
         if filetype ==# 'markdown'
             this.ApplyMarkdownHighlighting()
         endif
-        normal! G
+        # Stamp the originating chat session onto this buffer so that
+        # :AIModel run from here (e.g. from a :AIModels list opened
+        # from a chat buffer) can update the correct session snapshot.
+        # No-op when source_chat_id is '' (all non-chat-context calls).
+        if !empty(source_chat_id)
+            b:ai_source_chat_id = source_chat_id
+        endif
+        if cursor == 'top'
+            normal! gg
+        else
+            normal! G
+        endif
     enddef
 
     # Refreshes the message_log.txt buffer in place if it is currently

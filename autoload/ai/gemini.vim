@@ -1,4 +1,3 @@
-"use vim9 script only:
 vim9script
 
 # autoload/ai/gemini.vim
@@ -10,8 +9,9 @@ vim9script
 # Claude/OpenAI provider code is needed.
 #
 # Per-chat model and api_version are read from the ChatSessionInfo
-# registry via this.config.GetChatSessionModel(chat_id) and
-# this.config.GetChatSessionApiVersion(chat_id). When chat_id is ''
+# registry. ResolveModelAndVersion looks up the session once via
+# this.config.GetChatSession(chat_id) and then reads individual fields
+# via GetSessionModel / GetSessionApiVersion. When chat_id is ''
 # (one-shot commands: :AIQuery, :AIExplain, :AIReview, :AIReviewFile),
 # the provider falls back to the global config fields
 # this.config.gemini_model and this.config.gemini_api_version.
@@ -65,18 +65,22 @@ export class GeminiProvider extends Provider.AIProvider
         return model =~ '^gemini-'
     enddef
 
-    # Resolve model and api_version for this call. When chat_id is
-    # non-empty, read from the per-chat session snapshot; otherwise fall
-    # back to global config. This is the only place in this provider that
-    # decides which model/version to use.
+    # Resolve model and api_version for this call. Looks up the session
+    # once via GetChatSession, then reads individual fields via the
+    # per-field getters (GetSessionModel / GetSessionApiVersion) so
+    # active_chats is only scanned once per call.
+    # When chat_id is empty, falls back to global config.
     def ResolveModelAndVersion(chat_id: string): dict<string>
         if !empty(chat_id)
-            var m = this.config.GetChatSessionModel(chat_id)
-            var v = this.config.GetChatSessionApiVersion(chat_id)
-            return {
-                model:       !empty(m) ? m : this.config.gemini_model,
-                api_version: !empty(v) ? v : this.config.gemini_api_version,
-            }
+            var session = this.config.GetChatSession(chat_id)
+            if !empty(session)
+                var m = this.config.GetSessionModel(session)
+                var v = this.config.GetSessionApiVersion(session)
+                return {
+                    model:       !empty(m) ? m : this.config.gemini_model,
+                    api_version: !empty(v) ? v : this.config.gemini_api_version,
+                }
+            endif
         endif
         return {
             model:       this.config.gemini_model,

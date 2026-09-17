@@ -9,11 +9,15 @@ vim9script
 # and the canned Explain/Review prompt templates. Fully standalone -
 # no dependency on config, providers, or buffer display.
 #
+# Public API is exposed via prompt_api.vim (facade). All methods here
+# are internal - do not import this file directly from core.vim.
+#
 # Two families of reference syntax coexist deliberately:
 #   - {='a=} / {=1,10<'a>=} - register-indirected. The name of the
 #     buffer/file is stored in a register first; useful when you've
 #     already navigated to and yanked from the source, or want a
-#     specific line range.
+#     specific line range. Register content expands inline with no
+#     wrapper - it is a direct substitution into the prompt text.
 #   - {=<name=} / {=>name=} / {=>*=} - direct-name, :AIChat-only. The
 #     name is typed straight into the prompt. No line-range support by
 #     design: these are meant for whole-file read/write (e.g. "convert
@@ -23,173 +27,199 @@ vim9script
 # after '{=', which the register forms never produce (they start with
 # either "'" or a line-range digit).
 #
-# Multiple {=<name=} (or register/range) reads in a single prompt each
-# get wrapped with a "##### FILE: name #####" / "##### END FILE #####"
-# delimiter (see LabelFile) so the model can tell several inlined
-# files apart - important for multi-file requests like "rework these
-# three files and write new versions", where unlabeled content
-# concatenated together would be ambiguous about which file is which.
+# File reads ({=<name=}, {=1,10<'a>=}) are wrapped with [ID:/END ID:]
+# markers (see FILE_ID_BEG/FILE_ID_END) so the model can distinguish
+# multiple inlined files and knows how to label its own output for
+# round-trip routing via {=>*=} or {=>name=}. The instruction telling
+# the model to use these markers on output lives in core.vim alongside
+# the write-target directives, not here.
 #
 # {=>name=} still expects exactly one fenced code block back and
 # writes it to that one named buffer. {=>*=} is for when the number of
-# output files isn't fixed in advance, or you don't want to trust the
-# model to label its own output correctly: every fenced block in the
+# output files isn't fixed in advance: every fenced block in the
 # response becomes its own new buffer, left for the user to inspect
-# and save under whatever name they choose - no attempt is made to
-# guess which block corresponds to which real file. {=> dir/*=} is the
-# same wildcard form with a directory prefix: identified blocks that
-# get written straight to disk land under 'dir/' (created via mkdir -p
-# if it doesn't exist yet) instead of at their bare id-derived path.
+# and save under whatever name they choose. {=> dir/*=} is the same
+# wildcard form with a directory prefix: identified blocks land under
+# 'dir/' (created via mkdir -p if needed) instead of their bare path.
 
 export class AIPrompt
-    # Set by SetError() (called from every *Sub()/GetBufferRange*()
-    # failure point below) when a reference can't be resolved. {= =}
-    # are meant to be absolute quotes: the only thing that should ever
-    # come out of them is a register/buffer/file lookup performed
-    # against the raw prompt the user typed. If any single reference
-    # in that raw prompt fails to resolve, the whole expansion is
-    # aborted and the original prompt is returned unchanged, rather
-    # than returning a prompt that's half-expanded - see
-    # ExpandReferences below.
-    #
-    # Deliberately does NOT use echoerr from inside the *Sub() methods
-    # to signal this: echoerr throws a catchable exception, and doing
-    # that from inside the \=expr callback substitute() evaluates
-    # would abort substitute() itself mid-pass, meaning had_error would
-    # never actually get set and ExpandReferences would never reach
-    # its own fallback return - the exception would just propagate,
-    # uncaught, straight out of the caller. SetError()/last_error let
-    # the whole substitute() pass finish normally, so this flag (and
-    # the fallback behavior below) actually works. Callers (see
-    # AIPlugin.Ask/ChatSend) must check had_error after calling
-    # ExpandReferences and decline to send the query if it's set,
-    # rather than silently sending back whatever came out.
+    # Set by SetError() on any reference resolution failure. Never
+    # accessed directly by callers - read via HadError()/LastError()
+    # getters exposed through prompt_api.vim. If any single reference
+    # fails, ExpandReferences aborts and returns the original prompt
+    # unchanged rather than sending a half-expanded result.
     var had_error: bool = false
     var last_error: string = ''
 
-    # All three reference families are matched in ONE pass over the
-    # ORIGINAL prompt string via substitute(..., 'g'). This is
-    # deliberate and load-bearing: substitute() evaluates the
-    # replacement expression once per match found in the *source*
-    # string and never rescans replacement text for further matches.
+    # ASCII BEL (0x07) - used as a positional placeholder during macro
+    # expansion. Chosen because it cannot be typed or pasted into a
+    # prompt accidentally, is visible in debug traces (:set list), and
+    # has no special meaning to Vim's substitute(). One marker per
+    # macro occurrence; ordering between pass 1 and pass 2 is what
+    # ties each marker back to its expansion.
+    const MACRO_MARKER = "\x07"
+
+    # Matches any {=...=} macro token. Non-greedy .\{-} is required
+    # (not [^=]*) because valid macro content can contain '=' - e.g.
+    # {=<foo=bar.vim=} or the >= inside {=1,10<'a>=}. Non-greedy
+    # stops at the earliest =} rather than the last, so two macros on
+    # the same line are extracted independently.
+    const MACRO_PATTERN = '{=.\{-}=}'
+
+    # Symmetric [ID:]/[END ID:] markers for file content sent to and
+    # received from the model. printf() format strings - call as
+    # printf(FILE_ID_BEG, filename) etc. Kept as constants so input
+    # labeling (LabelFile, LabelFileForRoundTrip) and output parsing
+    # (ExtractIdentifiedBlocks) can't drift out of sync, and the
+    # format can be changed in one place if needed.
+    # No leading/trailing \n - call sites control spacing explicitly.
+    const FILE_ID_BEG = '[ID: %s]'
+    const FILE_ID_END = '[END ID: %s]'
+
+    # Two-pass macro expansion. Expanded content is never rescanned
+    # for further macros - MACRO_MARKER placeholders inserted in pass 1
+    # are replaced with fully-expanded text in pass 2, so {=...=}
+    # syntax that happens to appear inside a file's content or a
+    # register value is never accidentally processed.
     #
-    # The previous implementation used `while expanded =~ pattern` and
-    # manually spliced in replacement text, then re-ran the regex
-    # search against the *whole*, now-mutated string on every
-    # iteration. That meant register/buffer/file content - arbitrary
-    # data the user doesn't control the shape of (an old AI reply
-    # quoting this plugin's own {=...=} syntax, a code sample
-    # containing a similar-looking token, etc.) - could itself be
-    # re-matched and expanded again on the next loop pass. {= =} must
-    # only ever be recognized in what the user actually typed; this
-    # single substitute() pass guarantees that.
+    # Pass 1: walk the original prompt left-to-right, extracting each
+    #   {=...=} token verbatim into macro_refs and replacing it with
+    #   a single MACRO_MARKER. Only the first match is replaced per
+    #   iteration (no 'g' flag) so extraction order matches marker
+    #   order exactly.
+    #
+    # Pass 2: expand each token in macro_refs in order, substituting
+    #   the next MACRO_MARKER with the result. On any expansion error,
+    #   report it and return the ORIGINAL prompt unchanged.
+    # PUBLIC - called from prompt_api.vim.
     def ExpandReferences(prompt: string): string
         this.had_error = false
         this.last_error = ''
-        var pattern = '{=\%(''\([a-zA-Z0-9#%]\)\|\([^<]\+\)<''\([a-zA-Z0-9#%]\)>\|<\([^=]\+\)\)=}'
-        var expanded = substitute(prompt, pattern, '\=this.ReferenceSub()', 'g')
-        if this.had_error
-            echoerr this.last_error
+
+        # Pass 1: extract tokens, plant markers.
+        var macro_refs: list<string> = []
+        var work = prompt
+        while work =~ this.MACRO_PATTERN
+            add(macro_refs, matchstr(work, this.MACRO_PATTERN))
+            work = substitute(work, this.MACRO_PATTERN, this.MACRO_MARKER, '')
+        endwhile
+
+        # No macros found - return prompt as-is, nothing to do.
+        if empty(macro_refs)
             return prompt
         endif
-        return expanded
+
+        # Pass 2: expand each token, replace next marker with result.
+        for token in macro_refs
+            var expanded = this.ExpandOneMacro(token)
+            if this.had_error
+                echoerr this.last_error
+                return prompt
+            endif
+            # escape() guards against \ and & in expanded content being
+            # misinterpreted as substitute() replacement special chars.
+            work = substitute(work, this.MACRO_MARKER, escape(expanded, '\&'), '')
+        endfor
+
+        return work
     enddef
 
-    # Records a failure without throwing (see the had_error comment
-    # above for why this matters), and returns '' so call sites can
-    # write `return this.SetError(...)` in one line.
+    # Records a failure without throwing, and returns '' so call sites
+    # can write `return this.SetError(...)` in one line. Never calls
+    # echoerr directly - that is left to ExpandReferences so the full
+    # substitute() pass always completes before any error is reported.
     def SetError(msg: string): string
         this.had_error = true
         this.last_error = msg
         return ''
     enddef
 
-    # Wraps a read reference's content with a delimiter naming its
-    # source, so multiple {=<name=}/{=1,10<'a>=} references expanded
-    # into the same prompt are distinguishable from each other. Before
-    # this, three unlabeled file bodies concatenated back to back gave
-    # the model no way to tell where one file ended and the next
-    # began, or which was which - fine for the original single-file
-    # use case, silently broken for multi-file prompts.
+    # Wraps a range-read reference with [ID:/END ID:] markers so the
+    # model can distinguish multiple inlined file fragments. range_desc
+    # (e.g. 'lines 1-10') is appended to the opening marker when given.
+    # Used by BufferSub only - not DirectSub, which uses
+    # LabelFileForRoundTrip to include the round-trip output contract.
     def LabelFile(name: string, content: string, range_desc: string = ''): string
         var suffix = empty(range_desc) ? '' : $' ({range_desc})'
-        return $"##### FILE: {name}{suffix} #####\n" .. content .. $"\n##### END FILE: {name} #####"
+        return printf(this.FILE_ID_BEG, name .. suffix) .. "\n"
+            .. content .. "\n"
+            .. printf(this.FILE_ID_END, name)
     enddef
 
     # {=<name=} whole-file round-trip label (used by DirectSub only).
-    # Replaces the "##### FILE: name #####" / "##### END FILE #####"
-    # fence pair with a single instruction line, for two reasons at
-    # once: it's shorter (fewer tokens per file, which matters once
-    # {=<july25/*.vim=} is pulling in a whole directory), and unlike
-    # the old delimiter - which only ever labeled the INPUT - it also
-    # tells the model how to label its OUTPUT, by asking it to open its
-    # reply with a matching `[ID: name]` marker. That marker is what
-    # lets a later {=>*=} response be routed straight back to the real
-    # file instead of landing in a generic, unlabeled [AI-output-N]
-    # buffer - see ExtractIdentifiedBlocks below and
-    # AIBuffer.WriteResponseToWildcard.
-    #
-    # Kept to whole-file reads only (DirectSub) - not BufferSub's
-    # line-range reads. A range is a fragment; even if the model tagged
-    # it, writing that reply back over the whole real file would
-    # clobber everything outside the range. BufferSub keeps the plain
-    # LabelFile wrapper, with no round-trip contract implied.
-    #
-    # [END ID: name] closes the block explicitly (rather than relying
-    # on the next `[ID: ...]` line, or end of prompt, to imply a
-    # boundary) so multiple whole files pulled into one prompt via a
-    # glob - each wrapped separately in DirectSub - stay unambiguous
-    # about where one file's content ends and the next begins.
-    #
-    # The instruction is deliberately conditional ("if - and only if -
-    # you return an updated version") rather than an unconditional
-    # "start your response with the tagged file" demand. An earlier,
-    # unconditional version of this wording caused a plain "here's a
-    # file, just answer this question about it" turn (no {=>*=} in
-    # sight) to have the model dump the entire file back into the
-    # visible chat log anyway, just to comply with the instruction,
-    # even though the round-trip protocol was never going to be used.
-    # Making it conditional keeps the ID-tagging contract available for
-    # the genuine two-turn workflow this exists for - read a file now,
-    # ask for it back reshaped via {=>*=} in a LATER turn, relying on
-    # this instruction still being present in that earlier turn's
-    # history for the model to know what name to tag - without forcing
-    # a tag-and-dump on every turn that merely reads a file for
-    # context.
+    # Wraps file content with [ID:/END ID:] markers so the model sees
+    # the same format it is asked to use on output. The instruction
+    # telling the model to echo these markers lives in core.vim alongside
+    # the write-target directives - stated once per turn, not per file.
+    # [END ID:] closes each block explicitly so multiple files pulled in
+    # via a glob stay unambiguous about boundaries.
+    # BufferSub uses plain LabelFile instead - a line-range fragment has
+    # no round-trip contract implied.
     def LabelFileForRoundTrip(name: string, content: string): string
-        return $"The following file, '{name}', is provided for this request. If - and only if - your response includes a full replacement version of this file, begin that portion of your reply with exactly `[ID: {name}]` on its own line, immediately followed by the code, with nothing else in between. If you are not returning an updated version of this file (e.g. you were only asked a question about it, or the request doesn't call for changing it), just respond normally - do not include the `[ID: {name}]` marker or repeat the file's contents.\n" .. content .. $"\n[END ID: {name}]"
+        return printf(this.FILE_ID_BEG, name) .. "\n"
+            .. content .. "\n"
+            .. printf(this.FILE_ID_END, name)
     enddef
 
-    # Dispatches a single matched {=...=} token to the right family
-    # based on which submatch group is non-empty. Called once per
-    # match in the original prompt, never on already-expanded text.
-    def ReferenceSub(): string
-        if submatch(1) != ''
-            return this.RegisterSub(submatch(1))
-        elseif submatch(3) != ''
-            return this.BufferSub(submatch(2), submatch(3))
-        elseif submatch(4) != ''
-            return this.DirectSub(submatch(4))
+    # Dispatches one raw {=...=} token to the right handler by
+    # inspecting its inner content directly - no submatch() needed.
+    #
+    # The three forms and how they are distinguished:
+    #   {='a=}         inner starts with '     -> RegisterSub(reg)
+    #   {=1,10<'a>=}   inner matches range<'X> -> BufferSub(range, reg)
+    #   {=<name=}      inner starts with <     -> DirectSub(name)
+    #
+    # Write forms ({=>name=}, {=>*=}) are stripped by ExtractWriteTarget
+    # before ExpandReferences is called, so they never reach here.
+    # An empty token {==} expands to '' silently - harmless no-op.
+    def ExpandOneMacro(token: string): string
+        # Strip the {= =} fences to get the raw inner content.
+        var inner = token[2 : -3]
+
+        if empty(inner)
+            # {==} - empty macro, silent no-op.
+            return ''
         endif
-        # Shouldn't happen given the pattern, but leave untouched
-        # rather than silently dropping text.
-        return submatch(0)
+
+        if inner[0] == "'"
+            # {='a=} - single register letter follows the quote.
+            return this.RegisterSub(inner[1])
+
+        elseif inner =~ "^[^<]*<'"
+            # {=1,10<'a>=} - range then <'X>.
+            var range_str = matchstr(inner, '^[^<]\+')
+            var reg_name  = matchstr(inner, "<'\\zs[a-zA-Z0-9#%]\\ze>$")
+            if empty(reg_name)
+                return this.SetError($"Malformed buffer-range macro: {token}")
+            endif
+            return this.BufferSub(range_str, reg_name)
+
+        elseif inner[0] == '<'
+            # {=<name=} - direct file/buffer/glob read.
+            return this.DirectSub(inner[1 : ])
+
+        endif
+
+        # Unrecognised form - leave the original token in place so the
+        # user can see what wasn't recognised.
+        return token
     enddef
 
-    # {='a=} - register-indirected read. Not associated with a
-    # filename, so labeled by register letter rather than by name -
-    # still needed once two different registers land in the same
-    # prompt.
+    # {='a=} - expands the content of vim register 'a' (or '#', '%',
+    # etc.) inline into the prompt with no wrapper. Registers are a
+    # direct substitution - the user placed {='r=} mid-sentence and
+    # wants the content there, not a labeled block.
     def RegisterSub(reg_name: string): string
         var reg_content = getreg(reg_name)
         if empty(reg_content)
             return this.SetError($"Register '{reg_name}' is empty or does not exist")
         endif
-        return $"##### REGISTER '{reg_name} #####\n" .. reg_content .. $"\n##### END REGISTER '{reg_name} #####"
+        return reg_content
     enddef
 
-    # {=1,10<'a>=} - register-indirected read of a line range from the
-    # buffer/file whose name is stored in register 'a.
+    # {=1,10<'a>=} - reads a line range from the buffer/file whose
+    # path is stored in register 'a. Wrapped with [ID:/END ID:] so
+    # the model can distinguish multiple inlined fragments.
     def BufferSub(range_str: string, reg_name: string): string
         var buf_name = getreg(reg_name)
         if empty(buf_name)
@@ -197,28 +227,18 @@ export class AIPrompt
         endif
 
         var buf_content = this.GetBufferRange(buf_name, range_str)
-        if empty(buf_content)
+        if this.had_error || empty(buf_content)
             return ''
         endif
         return this.LabelFile(buf_name, buf_content, $'lines {substitute(range_str, ",", "-", "")}')
     enddef
 
-    # {=<name=} - read the WHOLE contents of buffer/file `name`, given
-    # directly rather than via a register. Reuses GetBufferRange's
-    # existing buffer-then-disk-fallback lookup with an implicit
-    # "1,$" range, so this is just sugar over the same resolution logic
-    # the register-indirected form uses.
-    # Supports glob patterns (e.g. {=<july25/*.vim=}) to read and inline
-    # multiple matching files at once.
-    #
-    # Always uses LabelFileForRoundTrip (not a plain LabelFile) even
-    # when the current turn has no {=>*=}/{=>name=} write directive of
-    # its own - the two-turn workflow (read a file now, ask for it back
-    # reshaped via {=>*=} in a LATER turn) depends on this turn's
-    # history still carrying the `[ID: name]` instruction for the model
-    # to reuse then. See LabelFileForRoundTrip for how the instruction
-    # itself stays conditional so this doesn't cause the model to dump
-    # the file back on a turn that never asked for it.
+    # {=<name=} - read the whole contents of buffer/file `name` given
+    # directly rather than via a register. Supports glob patterns
+    # (e.g. {=<july25/*.vim=}) to inline multiple files at once.
+    # Always uses LabelFileForRoundTrip so [ID:/END ID:] markers are
+    # present in history for the two-turn round-trip workflow even when
+    # the current turn has no {=>*=} write directive.
     def DirectSub(name_raw: string): string
         var pattern = trim(name_raw)
         if pattern =~ '[*?{}]'
@@ -240,7 +260,7 @@ export class AIPrompt
         else
             var name = pattern
             var content = this.GetBufferRange(name, '1,$')
-            if empty(content)
+            if this.had_error || empty(content)
                 return ''
             endif
             return this.LabelFileForRoundTrip(name, content)
@@ -277,6 +297,7 @@ export class AIPrompt
     # case - so a prompt that accidentally contains a second one still
     # gets it removed instead of leaking raw {=...=} syntax into what's
     # sent to the model.
+    # PUBLIC - called from prompt_api.vim.
     def ExtractWriteTarget(prompt: string): dict<any>
         var wildcard_pattern = '{=>\s*\([^=*]*\)\*\s*=}'
         var wildcard_match = matchlist(prompt, wildcard_pattern)
@@ -297,9 +318,9 @@ export class AIPrompt
         return {stripped: stripped, target: target, wildcard: false, output_dir: ''}
     enddef
 
-    # Shared fence-scanner used by both ExtractCodeBlock (single named
-    # target) and ExtractAllCodeBlocks (wildcard target) below, so the
-    # two can't drift out of sync on what counts as a fenced block.
+    # Shared fence-scanner used by ExtractCodeBlock and
+    # ExtractAllCodeBlocks so the two can't drift out of sync on what
+    # counts as a fenced block.
     def SplitFencedBlocks(response: string): list<list<string>>
         var blocks: list<list<string>> = []
         var current: list<string> = []
@@ -321,24 +342,17 @@ export class AIPrompt
         return blocks
     enddef
 
-    # Pulls the contents of a single fenced code block out of an AI
-    # response, for write-target turns where only the code - not the
-    # model's commentary - should land in the destination file/buffer.
-    # Falls back to the raw response if there isn't exactly one fenced
-    # block, so a malformed or chatty reply doesn't silently write
-    # nothing.
+    # PUBLIC - called from prompt_api.vim.
+    # Pulls the single fenced code block from a write-target response.
+    # Falls back to the raw response if there isn't exactly one block.
     def ExtractCodeBlock(response: string): string
         var blocks = this.SplitFencedBlocks(response)
         return len(blocks) == 1 ? join(blocks[0], "\n") : response
     enddef
 
-    # Pulls out EVERY fenced code block for a {=>*=} wildcard turn, one
-    # per output file the model produced, in response order - deciding
-    # which block belongs to which real filename is left to the user
-    # (see AIBuffer.WriteResponseToWildcard), not guessed here. Falls
-    # back to the whole response as a single block if the model didn't
-    # fence anything at all, so a malformed reply still opens one
-    # reviewable buffer instead of silently opening none.
+    # PUBLIC - called from prompt_api.vim.
+    # Pulls every fenced code block for a {=>*=} wildcard turn.
+    # Falls back to the whole response as one block if none are fenced.
     def ExtractAllCodeBlocks(response: string): list<string>
         var blocks = this.SplitFencedBlocks(response)
         if empty(blocks)
@@ -347,69 +361,57 @@ export class AIPrompt
         return mapnew(blocks, (_, b) => join(b, "\n"))
     enddef
 
-    # {=>*=} response parser for the `[ID: name]` round-trip protocol
-    # (see LabelFileForRoundTrip). Walks the response the same way
-    # SplitFencedBlocks does, but also watches for a `[ID: name]`
-    # marker line immediately before a fence and attaches it to the
-    # block that follows, so a reply built from one or more {=<name=}
-    # round-trip reads can be routed straight back to the real file
-    # (see AIBuffer.WriteResponseToWildcard) instead of a generic
-    # [AI-output-N] buffer.
+    # {=>*=} response parser for the [ID:/END ID:] round-trip protocol.
+    # Drives entirely off the [ID:]/[END ID:] markers - no triple-grave
+    # fences required or expected. Any text outside the markers (model
+    # preamble like "OK", commentary between files, etc.) is silently
+    # ignored, so the model can be conversational around the file blocks
+    # without breaking routing.
     #
-    # A block with no preceding marker comes back with id == '' - this
-    # is the normal case for a plain {=>*=} wildcard turn that never
-    # used {=<name=} round-trip reads, and it's routed through the same
-    # id-less fallback path WriteResponseToWildcard already had, so
-    # nothing changes for that use case.
+    # [END ID:] is matched loosely (.\{-} for the name) so a mismatched
+    # or slightly malformed closing tag still closes the block correctly
+    # rather than collecting lines forever.
     #
-    # This is a separate scan rather than a wrapper around
-    # SplitFencedBlocks: that helper discards every non-fence line
-    # outright, but the `[ID: ...]` marker line has to be read and
-    # correlated with the block that follows it, not thrown away.
+    # A block with id == '' means no [ID:] markers appeared at all -
+    # the whole response is returned as one unidentified block so the
+    # turn still opens something reviewable rather than silently
+    # producing nothing.
     def ExtractIdentifiedBlocks(response: string): list<dict<string>>
         var results: list<dict<string>> = []
         var pending_id = ''
-        var in_fence = false
+        var in_block = false
         var current: list<string> = []
 
         for line in split(response, '\n')
-            if !in_fence
+            if !in_block
                 var id_match = matchlist(line, '^\[ID:\s*\(.\{-}\)\s*\]$')
                 if !empty(id_match)
                     pending_id = id_match[1]
-                    continue
-                endif
-            endif
-
-            if line =~# '^```'
-                if in_fence
-                    add(results, {id: pending_id, code: join(current, "\n")})
-                    pending_id = ''
-                else
                     current = []
+                    in_block = true
                 endif
-                in_fence = !in_fence
-            elseif in_fence
+            elseif line =~# '^\[END ID:\s*.\{-}\s*\]$'
+                add(results, {id: pending_id, code: join(current, "\n")})
+                pending_id = ''
+                in_block = false
+                current = []
+            else
                 add(current, line)
             endif
         endfor
 
-        # Malformed/chatty reply with no fenced blocks at all - same
-        # fallback ExtractAllCodeBlocks uses: one unidentified block
-        # covering the whole response, so the turn still opens
-        # something reviewable instead of silently producing nothing.
+        # No [ID:] blocks found - return whole response as one
+        # unidentified block so the turn still produces something
+        # reviewable instead of silently opening nothing.
         if empty(results)
             return [{id: '', code: response}]
         endif
         return results
     enddef
 
-    # bufnr() treats a plain String argument as a file-name *pattern*
-    # (same partial-match rules as :buffer completion), not an exact
-    # name - e.g. "main" can silently match an open "domain.txt" or
-    # "main_test.go". Anchoring the pattern forces an exact match, so a
-    # near-miss correctly falls through to the disk-read fallback below
-    # instead of silently pulling a different buffer's content.
+    # bufnr() treats a plain string as a file-name pattern (partial
+    # match), not an exact name. Anchoring forces an exact match so a
+    # near-miss falls through to the disk-read fallback correctly.
     def ExactBufNr(buf_name: string): number
         return bufnr('^' .. escape(buf_name, '\.*$~[]') .. '$')
     enddef
@@ -427,10 +429,8 @@ export class AIPrompt
             return this.GetBufferRangeFromBuffer(buf_num, buf_name, start_line, end_str)
         endif
 
-        # Not a buffer Vim already knows about - fall back to reading it
-        # straight off disk. This is what lets {=1,14<'a>=} pull from any
-        # file whose path is in register 'a', even if you've never
-        # :edit-ed it, not just files already open as buffers.
+        # Not a buffer Vim knows about - fall back to disk so
+        # {=1,14<'a>=} works even for files never :edit-ed.
         return this.GetBufferRangeFromDisk(buf_name, start_line, end_str)
     enddef
 
@@ -456,10 +456,8 @@ export class AIPrompt
         return join(buf_lines, "\n")
     enddef
 
-    # buf_name here is a filesystem path (expand() handles '~' and
-    # relative paths against cwd) rather than an open buffer - used when
-    # the register content doesn't match any buffer Vim already knows
-    # about, so this file can be pulled in without ever :edit-ing it.
+    # buf_name is a filesystem path; expand() handles '~' and relative
+    # paths. Used when the name doesn't match any open buffer.
     def GetBufferRangeFromDisk(buf_name: string, start_line: number, end_str: string): string
         var path = expand(buf_name)
         if !filereadable(path)
@@ -476,6 +474,7 @@ export class AIPrompt
         return join(file_lines[start_line - 1 : end_line - 1], "\n")
     enddef
 
+    # PUBLIC - called from prompt_api.vim.
     def BuildExplainPrompt(selection: string, filetype: string, filename: string): string
         return "You are an expert developer. The following "
             .. filetype .. " code from file '" .. filename
@@ -487,6 +486,7 @@ export class AIPrompt
             .. "Here is the code:\n" .. selection
     enddef
 
+    # PUBLIC - called from prompt_api.vim.
     def BuildReviewPrompt(selection: string, filetype: string, filename: string): string
         return "You are an expert code reviewer. Review ONLY the "
             .. filetype .. " code from file '" .. filename

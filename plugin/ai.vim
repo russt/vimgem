@@ -32,7 +32,7 @@ endif
 # ============================================================================
 # This line is hardcoded/replaced when the distribution package is created.
 if !exists('g:vimgem_version')
-    g:vimgem_version = '0.1.260825'
+    g:vimgem_version = '0.1.260827'
 endif
 
 if empty(g:vimgem_version)

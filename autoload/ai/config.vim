@@ -1,4 +1,3 @@
-"use vim9 script only:
 vim9script
 
 # autoload/ai/config.vim
@@ -51,6 +50,7 @@ export const PROVIDER_MODEL_DEFAULTS: dict<string> = {
 #   model:       string  - model name at creation/resume time
 #   api_version: string  - api version at creation/resume time
 #   pid:         number  - getpid(), for future multi-process use
+#   md_file:     string  - full path to the chat's .md transcript file
 #
 # base_url is deferred - it is a provider-level global, not per-chat.
 export type ChatSessionInfo = dict<any>
@@ -170,9 +170,11 @@ export class AIConfig
     # AIPlugin.ChatResume() after the buffer is confirmed open. Snapshots
     # provider, model, and api_version from the current global config so
     # later global changes do not affect this chat's execution.
+    # md_file is the full path to the chat's .md transcript on disk,
+    # used by ShowChatInfo to count lines without reconstructing the path.
     # Returns the newly created ChatSessionInfo so the caller can inspect
     # it (e.g. to echo the confirmation message) without a second lookup.
-    def RegisterChatSession(chat_id: string, bufnr: number, provider: string, model: string, api_version: string): ChatSessionInfo
+    def RegisterChatSession(chat_id: string, bufnr: number, provider: string, model: string, api_version: string, md_file: string): ChatSessionInfo
         var entry: ChatSessionInfo = {
             chat_id:     chat_id,
             bufnr:       bufnr,
@@ -180,6 +182,7 @@ export class AIConfig
             model:       model,
             api_version: api_version,
             pid:         getpid(),
+            md_file:     md_file,
         }
         this.active_chats[chat_id] = entry
         return entry
@@ -223,34 +226,51 @@ export class AIConfig
         return this.GetChatSessionForBuffer(bufnr('%'))
     enddef
 
+    # Returns all registered chat sessions as a list, sorted by chat_id
+    # (which is timestamp-based, so this is chronological order).
+    # Used by ShowChatInfo to render the session list in :AIInfo.
+    def GetAllChatSessions(): list<ChatSessionInfo>
+        var all = values(this.active_chats)
+        return sort(all, (a, b) => a.chat_id < b.chat_id ? -1 : a.chat_id > b.chat_id ? 1 : 0)
+    enddef
+
     # -------------------------------------------------------------------------
-    # Per-field getters. All take chat_id: string. Return a safe zero
-    # value ('', 0) when the session does not exist, so callers do not
-    # need to guard every field access after confirming non-empty session.
+    # Per-field getters. All take session: ChatSessionInfo (already looked
+    # up by the caller via GetChatSession / GetChatSessionForBuffer /
+    # GetChatSessionForCurrentBuffer). Return a safe zero value ('', -1, 0)
+    # when the session is empty, so callers do not need to guard every field
+    # access after confirming non-empty session.
+    #
+    # Callers look up the session once and pass it here; this avoids
+    # repeated linear scans of active_chats for each field access.
     # -------------------------------------------------------------------------
 
-    def GetChatSessionChatId(chat_id: string): string
-        return get(this.GetChatSession(chat_id), 'chat_id', '')
+    def GetSessionChatId(session: ChatSessionInfo): string
+        return get(session, 'chat_id', '')
     enddef
 
-    def GetChatSessionBufNr(chat_id: string): number
-        return get(this.GetChatSession(chat_id), 'bufnr', -1)
+    def GetSessionBufNr(session: ChatSessionInfo): number
+        return get(session, 'bufnr', -1)
     enddef
 
-    def GetChatSessionProvider(chat_id: string): string
-        return get(this.GetChatSession(chat_id), 'provider', '')
+    def GetSessionProvider(session: ChatSessionInfo): string
+        return get(session, 'provider', '')
     enddef
 
-    def GetChatSessionModel(chat_id: string): string
-        return get(this.GetChatSession(chat_id), 'model', '')
+    def GetSessionModel(session: ChatSessionInfo): string
+        return get(session, 'model', '')
     enddef
 
-    def GetChatSessionApiVersion(chat_id: string): string
-        return get(this.GetChatSession(chat_id), 'api_version', '')
+    def GetSessionApiVersion(session: ChatSessionInfo): string
+        return get(session, 'api_version', '')
     enddef
 
-    def GetChatSessionPid(chat_id: string): number
-        return get(this.GetChatSession(chat_id), 'pid', 0)
+    def GetSessionPid(session: ChatSessionInfo): number
+        return get(session, 'pid', 0)
+    enddef
+
+    def GetSessionMdFile(session: ChatSessionInfo): string
+        return get(session, 'md_file', '')
     enddef
 
     # -------------------------------------------------------------------------

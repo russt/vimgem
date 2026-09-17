@@ -1,4 +1,3 @@
-"use vim9 script only:
 vim9script
 
 # autoload/ai/core.vim
@@ -31,6 +30,29 @@ vim9script
 #     failures the user needs to know about; plain echo for soft "nothing
 #     to do" feedback; try/catch around every external API call since
 #     GenerateContent/GenerateChat can throw on unexpected response shapes.
+#
+# ChatSessionInfo accessor pattern:
+#   Session lookups are done once per command (GetChatSession /
+#   GetChatSessionForCurrentBuffer / GetChatSessionForBuffer), and the
+#   resulting ChatSessionInfo is passed to per-field getters
+#   (GetSessionProvider, GetSessionModel, GetSessionApiVersion, etc.)
+#   rather than repeating the lookup for each field. This avoids repeated
+#   linear scans of active_chats and keeps call sites readable.
+#
+# ShowInfo() context-sensitivity:
+#   When called from a registered chat buffer, ShowInfo() delegates to
+#   ShowChatInfo() which renders a chat-session-focused view: current
+#   session provider/model, the session's provider config block, a list
+#   of all open chat sessions with line counts, and chat-specific
+#   commands. When called from any other buffer, the full global plugin
+#   info page is shown as before.
+#
+# ShowModels() context-sensitivity:
+#   When called from a registered chat buffer, ShowModels() stamps the
+#   resulting models scratch buffer with b:ai_source_chat_id so that
+#   :AIModel run from that buffer can find and update the originating
+#   chat session snapshot, even though the models buffer itself is not
+#   a registered chat buffer.
 
 import './config.vim' as Cfg
 import './provider.vim' as Provider
@@ -38,14 +60,13 @@ import './gemini.vim' as Gemini
 import './claude.vim' as Claude
 import './openai.vim' as OpenAI
 import './buffer.vim' as Buf
-import './prompt.vim' as Prm
+import './prompt_api.vim' as Prm
 import './util.vim' as Util
 
 export class AIPlugin
     var config: Cfg.AIConfig
     var providers: dict<Provider.AIProvider>
     var buffer: Buf.AIBuffer
-    var prompt: Prm.AIPrompt
 
     # Initialize all subsystems once at plugin load time. Every provider
     # is instantiated eagerly (not lazily) so a missing import or class
@@ -58,7 +79,6 @@ export class AIPlugin
         this.providers.claude = Claude.ClaudeProvider.new(this.config)
         this.providers.openai = OpenAI.OpenAIProvider.new(this.config)
         this.buffer = Buf.AIBuffer.new(this.config)
-        this.prompt = Prm.AIPrompt.new()
     enddef
 
     # Returns the globally-active provider. Used only by non-chat
@@ -69,13 +89,14 @@ export class AIPlugin
         return this.providers[this.config.provider]
     enddef
 
-    # Returns the provider for a specific chat session. Errors (returns
-    # the global provider as a safe fallback) if the session is not found
-    # or the session's provider name is not registered.
-    def GetChatSessionProvider(chat_id: string): Provider.AIProvider
-        var provider_name = this.config.GetChatSessionProvider(chat_id)
+    # Returns the provider for a specific chat session. Accepts an already-
+    # looked-up ChatSessionInfo so no second registry scan is needed.
+    # Errors (returns the global provider as a safe fallback) if the
+    # session is empty or the session's provider name is not registered.
+    def GetProviderForSession(session: Cfg.ChatSessionInfo): Provider.AIProvider
+        var provider_name = this.config.GetSessionProvider(session)
         if empty(provider_name) || !has_key(this.providers, provider_name)
-            echoerr $"GetChatSessionProvider: no registered session for chat '{chat_id}', using global provider."
+            echoerr $"GetProviderForSession: no registered session or unknown provider, using global provider."
             return this.GetCurrentProvider()
         endif
         return this.providers[provider_name]
@@ -88,7 +109,7 @@ export class AIPlugin
     # Emits a message that distinguishes the two cases so the user knows
     # what changed.
     def SetProvider(provider_name: string)
-        if !this.config.SetProvider(provider_name)
+        if !has_key(this.providers, provider_name)
             var valid = keys(this.providers)
             echoerr $"Invalid provider. Choose from: {join(valid, ', ')}"
             return
@@ -100,13 +121,15 @@ export class AIPlugin
 
         if !empty(session)
             # Called from a chat buffer: update the session snapshot too.
-            var chat_id = session.chat_id
+            var chat_id = this.config.GetSessionChatId(session)
             var api_version = this.config.ApiVersionForProvider(provider_name)
             this.config.UpdateChatSessionProvider(chat_id, provider_name)
             this.config.UpdateChatSessionModel(chat_id, default_model)
             this.config.UpdateChatSessionApiVersion(chat_id, api_version)
-            echo $"Provider is now '{provider_name}' for new chats, and for the current chat, model is '{default_model}'. Use :AIModel to change."
+            echo $"Provider set to '{provider_name}' for current chat, model is '{default_model}'. Use :AIModel to change."
         else
+            # No chat context - update the global default.
+            this.config.SetProvider(provider_name)
             echo $"AI provider set to: {provider_name}"
         endif
     enddef
@@ -157,7 +180,11 @@ export class AIPlugin
 
         var chat_id = this.buffer.CreateChat(provider_name, model)
         var bufnr = bufnr('%')
-        this.config.RegisterChatSession(chat_id, bufnr, provider_name, model, api_version)
+        # Expand the path at registration time so filereadable() and
+        # readfile() in ShowChatInfo work without a second expand() call.
+        # chat- prefix must match LogPath() in buffer.vim.
+        var md_file = expand(this.buffer.ChatDir() .. '/chat-' .. chat_id .. '.md')
+        this.config.RegisterChatSession(chat_id, bufnr, provider_name, model, api_version, md_file)
 
         echo $"AI Chat buffer created with provider '{provider_name}', model '{model}'. Type under '## You', then :AIChatSend."
     enddef
@@ -182,6 +209,8 @@ export class AIPlugin
         endif
 
         var chat_id = b:ai_chat_id
+        # Look up the session once; pass the ChatSessionInfo to all field
+        # getters below so active_chats is only scanned a single time.
         var session = this.config.GetChatSession(chat_id)
         if empty(session)
             echoerr $"AIChatSend: no registered session for chat '{chat_id}'. The chat may have been reopened without :AIChatResume."
@@ -194,10 +223,10 @@ export class AIPlugin
             return
         endif
 
-        var write_info = this.prompt.ExtractWriteTarget(raw_prompt)
-        var expanded_prompt = this.prompt.ExpandReferences(write_info.stripped)
-        if this.prompt.had_error
-            echoerr $"AIChatSend: {this.prompt.last_error}"
+        var write_info = Prm.ExtractWriteTarget(raw_prompt)
+        var expanded_prompt = Prm.ExpandReferences(write_info.stripped)
+        if Prm.HadError()
+            echoerr $"AIChatSend: {Prm.LastError()}"
             return
         endif
 
@@ -208,18 +237,20 @@ export class AIPlugin
         # code" instructions across turns, keeping the context cleaner.
         var history_prompt = expanded_prompt
 
+        # TODO: move to prompt.vim
         if write_info.wildcard
-            expanded_prompt ..= "\n\nRespond with only the resulting code, one fenced code block per file needed, with no other commentary."
+            expanded_prompt ..= "\n\nFor each file you return, wrap it as:\n[ID: filename]\n<content>\n[END ID: filename]\nRespond with only the resulting code, one fenced code block per file, with no other commentary."
         elseif !empty(write_info.target)
             expanded_prompt ..= "\n\nRespond with only the resulting code, in a single fenced code block, with no explanation."
         endif
 
         var history = this.buffer.LoadHistory(chat_id)
 
-        # Resolve provider from the session registry - never from global config.
-        var provider = this.GetChatSessionProvider(chat_id)
-        var provider_name = this.config.GetChatSessionProvider(chat_id)
-        var model = this.config.GetChatSessionModel(chat_id)
+        # Resolve provider and model from the session - never global config.
+        # Session was already looked up above; extract fields from it directly.
+        var provider = this.GetProviderForSession(session)
+        var provider_name = this.config.GetSessionProvider(session)
+        var model = this.config.GetSessionModel(session)
 
         echo $"Querying {provider_name} ({model})..."
 
@@ -263,14 +294,14 @@ export class AIPlugin
 
             var display = result.text
             if write_info.wildcard
-                var blocks = this.prompt.ExtractIdentifiedBlocks(result.text)
+                var blocks = Prm.ExtractIdentifiedBlocks(result.text)
                 var write_result = this.buffer.WriteResponseToWildcard(blocks, write_info.output_dir)
                 display = write_result.ok ? $'-> {write_result.summary}' : $'-> Error: {write_result.error}'
                 if write_result.ok
                     wildcard_first_win = write_result.first_win
                 endif
             elseif !empty(write_info.target)
-                var code = this.prompt.ExtractCodeBlock(result.text)
+                var code = Prm.ExtractCodeBlock(result.text)
                 var write_result = this.buffer.WriteResponseToTarget(write_info.target, code)
                 display = write_result.ok ? $'-> {write_result.summary}' : $'-> Error: {write_result.error}'
             endif
@@ -298,7 +329,7 @@ export class AIPlugin
             # Only accept b:ai_chat_id from a registered session buffer.
             var session = this.config.GetChatSessionForCurrentBuffer()
             if !empty(session)
-                target = session.chat_id
+                target = this.config.GetSessionChatId(session)
             endif
         endif
         if empty(target)
@@ -351,8 +382,12 @@ export class AIPlugin
         var model = provider.GetDefaultModel()
         var api_version = this.config.ApiVersionForProvider(provider_name)
         var bufnr = bufnr('%')
+        # Expand the path at registration time so filereadable() and
+        # readfile() in ShowChatInfo work without a second expand() call.
+        # chat- prefix must match LogPath() in buffer.vim.
+        var md_file = expand(this.buffer.ChatDir() .. '/chat-' .. resolved .. '.md')
 
-        this.config.RegisterChatSession(resolved, bufnr, provider_name, model, api_version)
+        this.config.RegisterChatSession(resolved, bufnr, provider_name, model, api_version, md_file)
 
         echo $"Resuming chat '{resolved}' with provider '{provider_name}', model '{model}'."
     enddef
@@ -379,9 +414,9 @@ export class AIPlugin
             return
         endif
         var user_prompt = join(lines, "\n")
-        var expanded_prompt = this.prompt.ExpandReferences(user_prompt)
-        if this.prompt.had_error
-            echoerr $"AIAsk: {this.prompt.last_error}"
+        var expanded_prompt = Prm.ExpandReferences(user_prompt)
+        if Prm.HadError()
+            echoerr $"AIAsk: {Prm.LastError()}"
             return
         endif
         this.Query('AIAsk', expanded_prompt)
@@ -396,7 +431,7 @@ export class AIPlugin
             return
         endif
         var selection = join(lines, "\n")
-        var user_prompt = this.prompt.BuildExplainPrompt(selection, &filetype, expand('%:t'))
+        var user_prompt = Prm.BuildExplainPrompt(selection, &filetype, expand('%:t'))
         this.Query('AIExplain', user_prompt)
     enddef
 
@@ -408,7 +443,7 @@ export class AIPlugin
             return
         endif
         var selection = join(lines, "\n")
-        var user_prompt = this.prompt.BuildReviewPrompt(selection, &filetype, expand('%:t'))
+        var user_prompt = Prm.BuildReviewPrompt(selection, &filetype, expand('%:t'))
         this.Query('AIReview', user_prompt)
     enddef
 
@@ -419,20 +454,40 @@ export class AIPlugin
         endif
         var file_content = getline(1, '$')
         var file_text = join(file_content, "\n")
-        var user_prompt = this.prompt.BuildReviewPrompt(file_text, &filetype, expand('%:t'))
+        var user_prompt = Prm.BuildReviewPrompt(file_text, &filetype, expand('%:t'))
         this.Query('AIReviewFile', user_prompt)
     enddef
 
+    # :AIModels - list available models for the current provider.
+    # When called from a registered chat buffer, stamps the resulting
+    # models scratch buffer with b:ai_source_chat_id so that :AIModel
+    # run from that buffer can find and update the originating chat
+    # session snapshot, even though the models buffer itself is not a
+    # registered chat buffer.
     def ShowModels()
-        var provider = this.GetCurrentProvider()
-        echo $"Fetching available models for {this.config.provider}..."
+        # Capture originating chat context before switching buffers.
+        var source_chat_id = ''
+        var chat_session = this.config.GetChatSessionForCurrentBuffer()
+        if !empty(chat_session)
+            source_chat_id = this.config.GetSessionChatId(chat_session)
+        endif
+
+        # Use the session's provider if in a chat, otherwise global.
+        var provider = empty(source_chat_id)
+            ? this.GetCurrentProvider()
+            : this.GetProviderForSession(chat_session)
+        var provider_name = empty(source_chat_id)
+            ? this.config.provider
+            : this.config.GetSessionProvider(chat_session)
+
+        echo $"Fetching available models for {provider_name}..."
 
         try
             var response = provider.ListModels()
-            var lines = [$'# {toupper(this.config.provider)} Models', '', ''] + split(response, '\n')
+            var lines = [$'# {toupper(provider_name)} Models', '', ''] + split(response, '\n')
             add(lines, '')
             add(lines, 'Put the cursor on a model line and run :AIModel to switch to it.')
-            this.buffer.DisplayText(lines)
+            this.buffer.DisplayText(lines, 'text', '', source_chat_id, 'top')
             echo "Model list retrieved."
         catch
             echoerr "Error fetching models: " .. v:exception
@@ -475,7 +530,7 @@ export class AIPlugin
             return
         endif
 
-        var chat_id = session.chat_id
+        var chat_id = this.config.GetSessionChatId(session)
         var lines = this.buffer.ShowJsonHistory(chat_id)
         if empty(lines)
             echo $"DBGShowJson: no history found for chat '{chat_id}'."
@@ -566,7 +621,7 @@ export class AIPlugin
         if empty(session)
             return
         endif
-        var chat_id = session.chat_id
+        var chat_id = this.config.GetSessionChatId(session)
         if key == 'gemini_model' || key == 'claude_model' || key == 'openai_model'
             this.config.UpdateChatSessionModel(chat_id, value)
         elseif key == 'gemini_api_version' || key == 'claude_api_version'
@@ -574,9 +629,18 @@ export class AIPlugin
         endif
     enddef
 
-    # :AIInfo - assemble and display the full status page: config header,
-    # active provider's current settings, all commands, and .vimrc examples.
+    # :AIInfo - context-sensitive information display.
+    # When called from a registered chat buffer, delegates to ShowChatInfo()
+    # for a focused chat-session view. When called from any other context,
+    # shows the full global plugin info page.
     def ShowInfo()
+        var session = this.config.GetChatSessionForCurrentBuffer()
+        if !empty(session)
+            this.ShowChatInfo(session)
+            return
+        endif
+
+        # Global context: full plugin info page.
         var provider = this.GetCurrentProvider()
         var lines = this.config.GetHeaderLines()
             + ['', $'## {toupper(this.config.provider)} Configuration']
@@ -586,7 +650,8 @@ export class AIPlugin
             + ['', $'  # {toupper(this.config.provider)} settings']
             + provider.GetConfigLines()
 
-        # Find the header index matching '## ... Configuration' and insert version string
+        # Find the first '## ... Configuration' header and insert the
+        # version string immediately after it.
         var insert_idx = -1
         for idx in range(len(lines))
             if lines[idx] =~? '^##.*Configuration'
@@ -599,8 +664,87 @@ export class AIPlugin
             insert(lines, $'  vimgem version: {g:vimgem_version}', insert_idx + 1)
         endif
 
-        this.buffer.DisplayText(lines)
+        this.buffer.DisplayText(lines, 'aimd', '', '', 'top')
         echo "Plugin info displayed."
+    enddef
+
+    # Render the chat-session-focused :AIInfo view. Called by ShowInfo()
+    # when the current buffer is a registered chat session.
+    #
+    # Sections:
+    #   1. Header - version, current provider/model for this chat,
+    #               always_review_received_files flag.
+    #   2. Provider config block - status lines for the session's provider
+    #      (not the global provider, which may differ after :AIProvider).
+    #   3. Session list - all open chat sessions sorted by chat_id, with
+    #      line count of each .md file. The current session is marked '*'.
+    #   4. Chat-context command reference.
+    def ShowChatInfo(session: Cfg.ChatSessionInfo)
+        var chat_id       = this.config.GetSessionChatId(session)
+        var provider_name = this.config.GetSessionProvider(session)
+        var model         = this.config.GetSessionModel(session)
+        var chat_provider = this.providers[provider_name]
+
+        # ── Section 1: header ────────────────────────────────────────────
+        var lines: list<string> = [
+            '# AI Chat Session Information',
+            '',
+            '## Configuration',
+            $'  vimgem version: {this.config.vimgem_version}',
+            $'  Current Provider: {provider_name}',
+            $'  Current Model: {empty(model) ? "(not set)" : model}',
+            $'  Always Review Received Files: {this.config.always_review_received_files ? "Yes" : "No"}',
+        ]
+
+        # ── Section 2: provider config block ─────────────────────────────
+        lines += [
+            '',
+            $'## {toupper(provider_name)} Configuration',
+        ]
+        lines += chat_provider.GetStatusLines()
+
+        # ── Section 3: open chat sessions ────────────────────────────────
+        lines += [
+            '',
+            '## Open Chat Sessions',
+            '  (* marks the current chat)',
+        ]
+
+        var all_sessions = this.config.GetAllChatSessions()
+        if empty(all_sessions)
+            lines += ['  (none)']
+        else
+            for s in all_sessions
+                var sid    = this.config.GetSessionChatId(s)
+                var sprov  = this.config.GetSessionProvider(s)
+                var smodel = this.config.GetSessionModel(s)
+                var smd    = this.config.GetSessionMdFile(s)
+                # md_file is already expanded at registration time (Chat /
+                # ChatResume both call expand() before RegisterChatSession).
+                var nlines = filereadable(smd) ? len(readfile(smd)) : 0
+                var marker = sid == chat_id ? '*' : ' '
+                var mname  = empty(smodel) ? '(not set)' : smodel
+                lines += [$'  {marker}{sid}: {sprov}/{mname} ({nlines} lines)']
+            endfor
+        endif
+
+        # ── Section 4: chat-context command reference ─────────────────────
+        lines += [
+            '',
+            '## Commands in Chat Session Context',
+            '  :AIInfo                     - Show information specific to this Chat',
+            '  :AIProvider <name>          - Change chat Provider (gemini|claude|openai)',
+            '  :AIModel [model]            - Change or display model for this Chat Session',
+            '  :AIModels                   - List available models for this Chat Provider',
+            '  :AIChatClear                - Clear this chat''s history',
+            '  :AIChatSend                 - Send the chat buffer',
+            '  :AIChatDisplay              - Show Chat Session markdown as HTML in browser',
+            '  :DBGShowAST                 - Display the Markdown AST for this Chat buffer',
+            '  :DBGShowJson                - Show human-readable JSON for Chat Session History',
+        ]
+
+        this.buffer.DisplayText(lines, 'aimd', '', '', 'top')
+        echo $"Chat info displayed for '{chat_id}'."
     enddef
 
     # :AIModel [name] - set the active provider's default model globally.
@@ -609,6 +753,9 @@ export class AIPlugin
     # With a name: set it directly, regardless of cursor position.
     # If called from a chat buffer, also updates that chat's session
     # snapshot so the change takes effect immediately for the current chat.
+    # If called from a models list buffer spawned by :AIModels from a chat
+    # context, b:ai_source_chat_id carries the originating chat_id so the
+    # session snapshot is updated even from the models buffer.
     def SetModel(model: string, lnum: number)
         var provider = this.GetCurrentProvider()
         var target = model
@@ -620,16 +767,24 @@ export class AIPlugin
             return
         endif
 
-        # Update the global config default for the current provider.
-        var model_key = this.config.provider .. '_model'
-        this.config.Set(model_key, target)
-
-        # If called from a chat buffer, also update that chat's snapshot.
+        # Resolve which chat session to update, if any.
+        # Priority: current buffer is a chat > current buffer is a models
+        # list stamped with b:ai_source_chat_id > no session (global only).
+        # Global default is only updated when there is no chat session to update,
+        # so :AIModel from a chat context never silently changes the global default.
         var session = this.config.GetChatSessionForCurrentBuffer()
         if !empty(session)
-            this.config.UpdateChatSessionModel(session.chat_id, target)
-            echo $"Model set to '{target}' (global default and current chat)."
+            var chat_id = this.config.GetSessionChatId(session)
+            this.config.UpdateChatSessionModel(chat_id, target)
+            echo $"Model set to '{target}' (current chat '{chat_id}' only)."
+        elseif exists('b:ai_source_chat_id') && !empty(b:ai_source_chat_id)
+            var source_id = b:ai_source_chat_id
+            this.config.UpdateChatSessionModel(source_id, target)
+            echo $"Model set to '{target}' (current chat '{source_id}' only)."
         else
+            # No chat context - update the global default.
+            var model_key = this.config.provider .. '_model'
+            this.config.Set(model_key, target)
             echo $"Model set to '{target}' (global default for new chats)."
         endif
     enddef

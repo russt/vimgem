@@ -1,4 +1,3 @@
-"use vim9 script only:
 vim9script
 
 # autoload/ai/openai.vim
@@ -11,12 +10,13 @@ vim9script
 # interface it implements) and util.vim (for RedactSecret/StripChatArtifacts).
 # None of the Gemini/Claude provider code is needed.
 #
-# Per-chat model is read from the ChatSessionInfo registry via
-# this.config.GetChatSessionModel(chat_id). When chat_id is ''
+# Per-chat model is read from the ChatSessionInfo registry. ResolveModel
+# looks up the session once via this.config.GetChatSession(chat_id) and
+# then reads the model field via GetSessionModel. When chat_id is ''
 # (one-shot commands: :AIQuery, :AIExplain, :AIReview, :AIReviewFile),
 # the provider falls back to this.config.openai_model.
 # api_version is not used by the OpenAI protocol (the version is
-# encoded in the URL path /v1/...) so GetChatSessionApiVersion is not
+# encoded in the URL path /v1/...) so GetSessionApiVersion is not
 # consulted here.
 #
 # This provider never writes to this.config. Model and provider
@@ -147,14 +147,19 @@ export class OpenAIProvider extends Provider.AIProvider
         return output
     enddef
 
-    # Resolve model for this call. OpenAI protocol does not have a
-    # separate api_version field (the version is in the URL path /v1/).
-    # When chat_id is non-empty, read from the per-chat session snapshot;
-    # otherwise fall back to global config.
+    # Resolve model for this call. Looks up the session once via
+    # GetChatSession, then reads the model field via GetSessionModel so
+    # active_chats is only scanned once per call.
+    # OpenAI protocol does not have a separate api_version field (the
+    # version is in the URL path /v1/). When chat_id is empty, falls
+    # back to global config.
     def ResolveModel(chat_id: string): string
         if !empty(chat_id)
-            var m = this.config.GetChatSessionModel(chat_id)
-            return !empty(m) ? m : this.config.openai_model
+            var session = this.config.GetChatSession(chat_id)
+            if !empty(session)
+                var m = this.config.GetSessionModel(session)
+                return !empty(m) ? m : this.config.openai_model
+            endif
         endif
         return this.config.openai_model
     enddef
