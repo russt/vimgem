@@ -1,40 +1,58 @@
-"use vim9 script only:
+" Copyright (c) 2025-2026 Russ Tremain.
+" Released under the MIT License. See LICENSE file for details.
 vim9script
 
 # autoload/ai/md_syntax.vim
 #
-# MdSyntaxEmitter: renders Vim `:syntax`/`:highlight` Ex-command
-# strings that give a buffer decent, hand-rolled Markdown coloring -
-# the "future backend" md.vim's header comment once anticipated, an
-# alternative to md_html.vim's MdHtmlEmitter that targets `:syntax
-# region`/`:match` instead of HTML tags. Callers execute() every
-# returned string, in order, against the buffer `lines` came from (see
-# AIBuffer.ApplyMarkdownHighlighting in buffer.vim).
+# MdSyntaxEmitter: renders Vim `:syntax`/`:highlight` Ex-command strings
+# that colorize a Markdown buffer - the syntax-highlighting backend that
+# parallels md_html.vim's MdHtmlEmitter.
 #
-# Unlike MdHtmlEmitter, this doesn't walk MdParser's block AST at all -
-# inline markup (bold/italic/links/...) and structural markers
-# (headings/blockquotes/lists/hr/tables) are just well-anchored
-# regexes, the same way Vim's own bundled syntax files work, and don't
-# need node boundaries to be unambiguous. The one place line-accurate
-# boundaries genuinely matter is fenced code blocks: two ```python
-# blocks in the same buffer need their own non-overlapping regions so
-# `:syntax include`d language highlighting from one can never bleed
-# into the other, or into surrounding prose. FindFencedCodeBlocks does
-# one dedicated pass to locate those exactly, using the same
-# fence-detection rule md.vim's MdParser.Parse uses (any line matching
-# '^```' toggles code state).
+# Like MdHtmlEmitter, Render() walks the MdParser AST rather than
+# rescanning raw lines. Each block node drives its own constrained rules:
 #
-# fenced-code regions this emits are naturally immune to having stray
-# `*`/`_` characters in someone's code misread as emphasis, with no
-# extra bookkeeping needed on the "prose" side.
+#   heading    -> one \%Nl-anchored match for the whole line + level color
+#   hr         -> one \%Nl-anchored match
+#   paragraph  -> content-aware line-range inline rules (bold/italic/links/code spans)
+#                 constrained to the node's line range (\%>Nl\%<Ml)
+#   blockquote -> '>' marker match + content-aware inline rules on content range
+#   list       -> list-marker match + content-aware inline rules on item range, plus
+#                 recursive processing of item.children (e.g. codeblocks)
+#   table      -> pipe/cell matches constrained to table line range; the
+#                 separator line was consumed by the parser and is simply
+#                 left uncolored (no defensive regex needed)
+#   codeblock  -> one syntax region per block, line-range constrained via
+#                 \%Nl atoms, with :syntax include for the named language;
+#                 language syntax files are included once per unique language
+#                 to keep syntax trees fast and memory-efficient;
+#                 emphasis patterns can't bleed in because regions take
+#                 priority over matches
+#   turn       -> recurses into children (chat-log wrapper)
+#
+# Inline rules (bold, italic, links, code spans, strikethrough) mirror
+# MdHtmlEmitter._FormatInline's precedence order and use the same
+# conservative emphasis rules (no intraword _ emphasis, non-whitespace
+# immediately inside markers). Rules are emitted only when matching marker
+# characters actually exist in the node's text.
+#
+# Lang-tag-to-filetype mapping delegates to u.ResolveLang() in util.vim,
+# the single source shared with md_html.vim's :TOhtml path.
+#
+# FindFencedCodeBlocks is kept as a public static utility for callers
+# that only have raw lines; Render() uses the AST instead.
+#
+# Callers execute() every returned string in order against the target
+# buffer, then assign b:current_syntax = 'aimd' themselves (bare
+# assignment can't be execute()'d from vim9script - E1126).
+
+import './util.vim' as u
+
 export class MdSyntaxEmitter
 
-    # FindFencedCodeBlocks: single pass over raw buffer `lines`,
-    # returns one {lang: string, start: number, end: number} per fenced
-    # code block, 1-based and inclusive of both fence lines. `end` is
-    # the last line of the buffer if a fence is never closed - same
-    # "don't lose unterminated content" behavior as MdParser.Parse's
-    # own EOF cleanup.
+    # FindFencedCodeBlocks: single pass over raw buffer `lines`, returns
+    # one {lang, start, end} per fenced code block, 1-based line numbers,
+    # inclusive of both fence lines. Kept as a public utility for callers
+    # that only have raw lines; Render() uses the AST instead.
     static def FindFencedCodeBlocks(lines: list<string>): list<dict<any>>
         var blocks: list<dict<any>> = []
         var in_code = false
@@ -61,166 +79,290 @@ export class MdSyntaxEmitter
         return blocks
     enddef
 
-    # _ResolveLang: maps a fence tag to the Vim filetype whose
-    # syntax/<name>.vim actually defines its highlighting - e.g. a
-    # fence tagged ```js should embed syntax/javascript.vim, not go
-    # looking for a nonexistent syntax/js.vim. Anything not listed here
-    # is tried verbatim (covers the common case where the fence tag
-    # already matches its Vim filetype name, e.g. python, ruby, rust).
-    # Returns '' for an untagged fence, which callers leave as a plain
-    # (non-language-highlighted) code block.
-    static def _ResolveLang(lang: string): string
-        if empty(lang)
-            return ''
-        endif
-        var aliases: dict<string> = {
-            js: 'javascript', jsx: 'javascriptreact',
-            ts: 'typescript', tsx: 'typescriptreact',
-            py: 'python', rb: 'ruby', rs: 'rust', golang: 'go',
-            sh: 'sh', bash: 'sh', zsh: 'zsh', shell: 'sh',
-            yml: 'yaml', htm: 'html', kt: 'kotlin',
-            'c++': 'cpp', 'c#': 'cs', cs: 'cs',
-        }
-        return get(aliases, lang, lang)
-    enddef
-
-    # _SafeGroupSuffix: Vim group/cluster names are bare identifiers
-    # ([A-Za-z0-9_]) - fence tags can contain characters that aren't
-    # (`c++`, `objective-c`), so this sanitizes one into something safe
-    # to splice into a generated group name.
+    # _SafeGroupSuffix: sanitizes a lang string into a valid Vim syntax
+    # group name fragment ([A-Za-z0-9_] only). Needed because fence tags
+    # can contain characters like '+' or '-' (e.g. 'c++', 'objective-c').
     static def _SafeGroupSuffix(lang: string): string
         return substitute(lang, '[^A-Za-z0-9_]', '_', 'g')
     enddef
 
-    # _StaticRules: the content-independent half of Render() - generic
-    # Markdown-ish inline/structural highlighting that doesn't need to
-    # know anything about this specific buffer's content. Ordered to
-    # roughly match MdHtmlEmitter._FormatInline (code spans and links
-    # shielded as regions before emphasis is tried, bold+italic before
-    # bold before italic).
-    static def _StaticRules(): list<string>
+    # _HighlightGroups: one-time highlight group definitions, independent
+    # of buffer content. Emitted once at the top of Render()'s output.
+    # Uses 'default' so user colorscheme overrides always win.
+    static def _HighlightGroups(): list<string>
         return [
             'syntax case match',
-
-            # Inline code spans as a region (not a match) so the
-            # emphasis patterns below can't reach inside one - see this
-            # class's header comment on why regions are immune to that.
-            'syntax region aimdCode matchgroup=aimdCodeDelim start=/`/ end=/`/ oneline',
-
-            # Links / images: [text](url) / ![alt](url) - one region
-            # per link so the brackets/parens get a distinct (dim)
-            # delimiter color from the link text itself.
-            'syntax region aimdLink matchgroup=aimdLinkDelim start=/!\?\[/ end=/)/ contains=aimdLinkText oneline',
-            'syntax match aimdLinkText /\[\zs[^][]*\ze]/ contained',
-
-            'syntax match aimdBoldItalic /\*\*\*\S\@=[^*]\{-}\S\*\*\*/',
-            'syntax match aimdBoldItalic /\%(\w\)\@<!___\S\@=[^_]\{-}\S___\%(\w\)\@!/',
-            'syntax match aimdBold /\*\*\S\@=[^*]\{-}\S\*\*/',
-            'syntax match aimdBold /\%(\w\)\@<!__\S\@=[^_]\{-}\S__\%(\w\)\@!/',
-            'syntax match aimdItalic /\*\S\@=[^*]\{-}\S\*/',
-            'syntax match aimdItalic /\%(\w\)\@<!_\S\@=[^_]\{-}\S_\%(\w\)\@!/',
-            'syntax match aimdStrike /\~\~[^~]\{-}\~\~/',
-
-            # Structural markers - anchored to start-of-line so they
-            # can't misfire mid-sentence (e.g. a literal '# ' inside a
-            # paragraph).
-            'syntax match aimdH1 /^#\s\+.*$/',
-            'syntax match aimdH2 /^##\s\+.*$/',
-            'syntax match aimdH3to6 /^###\{1,4}\s\+.*$/',
-            'syntax match aimdHeaderMark /^#\{1,6}\ze\s/ contained containedin=aimdH1,aimdH2,aimdH3to6',
-            'syntax match aimdHR /^\s*\([*_-]\s*\)\{3,\}\s*$/',
-            'syntax match aimdBlockquote /^\s*>.*$/',
-            'syntax match aimdListMarker /^\s*\([-*+]\|\d\+\.\)\s\+/',
-            'syntax match aimdTableSep /^\s*|\?\s*:\?-\{3,\}:\?\s*\(|\s*:\?-\{3,\}:\?\s*\)*|\?\s*$/',
-            'syntax match aimdTablePipe /|/',
-
-            # Highlight-group links - `default` so a user's own
-            # colorscheme tweaks (:highlight aimdBold ...) always win
-            # over these.
-            'highlight default link aimdH1 Title',
-            'highlight default link aimdH2 Title',
-            'highlight default link aimdH3to6 Title',
+            'highlight default link aimdH1         Title',
+            'highlight default link aimdH2         Title',
+            'highlight default link aimdH3to6      Title',
             'highlight default link aimdHeaderMark Comment',
-            'highlight default aimdBold term=bold cterm=bold gui=bold',
-            'highlight default aimdItalic term=italic cterm=italic gui=italic',
-            'highlight default aimdBoldItalic term=bold,italic cterm=bold,italic gui=bold,italic',
-            'highlight default link aimdStrike Comment',
-            'highlight default link aimdCode String',
-            'highlight default link aimdCodeDelim Comment',
-            'highlight default link aimdLink Underlined',
-            'highlight default link aimdLinkText Underlined',
-            'highlight default link aimdLinkDelim Comment',
-            'highlight default link aimdHR Comment',
+            'highlight default      aimdBold       term=bold cterm=bold gui=bold',
+            'highlight default      aimdItalic     term=italic cterm=italic gui=italic',
+            'highlight default      aimdBoldItalic term=bold,italic cterm=bold,italic gui=bold,italic',
+            'highlight default link aimdStrike     Comment',
+            'highlight default link aimdCode       String',
+            'highlight default link aimdCodeDelim  Comment',
+            'highlight default link aimdLink       Underlined',
+            'highlight default link aimdLinkText   Underlined',
+            'highlight default link aimdLinkDelim  Comment',
+            'highlight default link aimdHR         Comment',
             'highlight default link aimdBlockquote Comment',
             'highlight default link aimdListMarker Identifier',
-            'highlight default link aimdTablePipe Special',
-            'highlight default link aimdTableSep Special',
-            'highlight default link aimdCodeFence Comment',
-            'highlight default link aimdCodeBlock Normal',
+            'highlight default link aimdTablePipe  Special',
+            'highlight default link aimdCodeFence  Comment',
+            'highlight default link aimdCodeBlock  Normal',
         ]
     enddef
 
-    # _FencedCodeRules: the content-dependent half of Render() - one
-    # `:syntax region` per fenced code block actually found in `lines`,
-    # each restricted to its own exact line range via the `\%NUMl` line
-    # atom (so two blocks, same or different language, never bleed
-    # into each other) and, when the fence names a language Vim ships a
-    # syntax file for, filled with that language's real highlighting
-    # via `:syntax include` into a per-block cluster - so e.g. a
-    # ```python block and a ```javascript block in the same response
-    # each get correct, independent highlighting.
-    static def _FencedCodeRules(lines: list<string>): list<string>
+    # _InlineRulesForRange: inline emphasis/link/code-span rules for a
+    # range of lines from `start_line` to `end_line` (1-based, inclusive).
+    # Content-aware: inspects `raw_text` to only emit rules when corresponding
+    # markers exist in the node, avoiding rule bloat on plain prose.
+    # Constrained via \%>Nl\%<Ml atoms so one command covers the whole node.
+    # Precedence order mirrors MdHtmlEmitter._FormatInline: code spans and
+    # links first (regions, so emphasis can't reach in), then bold+italic,
+    # bold, italic, strikethrough.
+    static def _InlineRulesForRange(start_line: number, end_line: number, raw_text: string): list<string>
         var cmds: list<string> = []
-        var blocks = MdSyntaxEmitter.FindFencedCodeBlocks(lines)
-        for idx in range(len(blocks))
-            var block = blocks[idx]
-            var start: number = block.start
-            var end: number = block.end
-            var lang: string = block.lang
-            var region = printf('aimdFenced%d', idx)
-            var resolved = MdSyntaxEmitter._ResolveLang(lang)
-            var contains = ''
+        if empty(raw_text)
+            return cmds
+        endif
 
-            if !empty(resolved)
-                var cluster = printf('aimdLang%d_%s', idx, MdSyntaxEmitter._SafeGroupSuffix(resolved))
-                # silent!: not every fence tag names a real Vim
-                # filetype with a bundled syntax file (typos, made-up
-                # languages, "text", ...) - fall through to the plain
-                # body group below rather than erroring the whole
-                # render over one bad tag.
-                cmds->add(printf('silent! syntax include @%s syntax/%s.vim', cluster, resolved))
-                cmds->add('unlet! b:current_syntax')
-                contains = printf(' contains=@%s', cluster)
-            endif
+        var l = start_line == end_line
+            ? printf('\%%%dl', start_line)
+            : printf('\%%>%dl\%%<%dl', start_line - 1, end_line + 1)
 
-            # keepend: so an embedded language's own region items (a
-            # multi-line string, say) can never grow past this block's
-            # own closing fence.
-            cmds->add(printf(
-                \ 'syntax region %s matchgroup=aimdCodeFence start=/\%%%dl^```/ end=/\%%%dl^```/ keepend%s',
-                \ region, start, end, contains))
-            if empty(resolved)
-                cmds->add(printf('highlight default link %s aimdCodeBlock', region))
-            endif
-        endfor
+        # Inline code spans: only emit if backtick exists
+        if raw_text =~ '`'
+            cmds->add(printf('syntax region aimdCode matchgroup=aimdCodeDelim'
+                .. ' start=/%s`/ end=/`/ oneline', l))
+        endif
+
+        # Links / images: only emit if square bracket exists
+        if raw_text =~ '\['
+            cmds->add(printf('syntax region aimdLink matchgroup=aimdLinkDelim'
+                .. ' start=/%s!\?\[/ end=/)/ contains=aimdLinkText oneline', l))
+            cmds->add(printf('syntax match aimdLinkText /%s\[\zs[^][]*\ze]/ contained', l))
+        endif
+
+        # Bold+italic, bold, italic: only emit if asterisks or underscores exist
+        if raw_text =~ '\*'
+            cmds->add(printf('syntax match aimdBoldItalic /%s\*\*\*\S\@=[^*]\{-}\S\*\*\*/', l))
+            cmds->add(printf('syntax match aimdBold       /%s\*\*\S\@=[^*]\{-}\S\*\*/', l))
+            cmds->add(printf('syntax match aimdItalic     /%s\*\S\@=[^*]\{-}\S\*/', l))
+        endif
+
+        if raw_text =~ '_'
+            cmds->add(printf('syntax match aimdBoldItalic /%s\%%(\w\)\@<!___\S\@=[^_]\{-}\S___\%%(\w\)\@!/', l))
+            cmds->add(printf('syntax match aimdBold       /%s\%%(\w\)\@<!__\S\@=[^_]\{-}\S__\%%(\w\)\@!/', l))
+            cmds->add(printf('syntax match aimdItalic     /%s\%%(\w\)\@<!_\S\@=[^_]\{-}\S_\%%(\w\)\@!/', l))
+        endif
+
+        # Strikethrough: only emit if tilde exists
+        if raw_text =~ '\~\~'
+            cmds->add(printf('syntax match aimdStrike /%s\~\~[^~]\{-}\~\~/', l))
+        endif
+
         return cmds
     enddef
 
-    # Render: the full, ordered command list for `lines` - callers
-    # execute() each one, in order, in the buffer `lines` came from,
-    # then set b:current_syntax = 'aimd' themselves (see
-    # AIBuffer.ApplyMarkdownHighlighting) - that assignment can't be
-    # part of this list, since `:let`/bare-assignment Ex-command
-    # strings aren't legal to execute() from a vim9script (E1126),
-    # only real vim9 assignment statements are. Leads with `syntax
-    # clear` so calling this again on a buffer whose content changed
-    # (e.g. a chat log buffer after AppendChatTurn adds another turn)
-    # starts from a clean slate rather than accumulating duplicate or
-    # stale region definitions from the previous render.
-    static def Render(lines: list<string>): list<string>
-        return ['silent! syntax clear', 'unlet! b:current_syntax']
-            \ + MdSyntaxEmitter._StaticRules()
-            \ + MdSyntaxEmitter._FencedCodeRules(lines)
+    # _HeadingRules: colors the full heading line and dims the '#' marks.
+    # The heading is always a single line (begin_line == end_line).
+    static def _HeadingRules(node: dict<any>): list<string>
+        var lnum = node.begin_line
+        var group = node.level <= 2 ? printf('aimdH%d', node.level) : 'aimdH3to6'
+        return [
+            printf('syntax match %s /\%%%dl.*$/', group, lnum),
+            printf('syntax match aimdHeaderMark /\%%%dl#\{1,6}\ze\s/'
+                .. ' contained containedin=%s', lnum, group),
+        ]
+    enddef
+
+    # _HRRules: colors the horizontal rule line.
+    static def _HRRules(node: dict<any>): list<string>
+        return [printf('syntax match aimdHR /\%%%dl.*$/', node.begin_line)]
+    enddef
+
+    # _ParagraphRules: applies inline rules once across the node's line range.
+    static def _ParagraphRules(node: dict<any>): list<string>
+        var text = join(get(node, 'lines', []), ' ')
+        return MdSyntaxEmitter._InlineRulesForRange(node.begin_line, node.end_line, text)
+    enddef
+
+    # _BlockquoteRules: colors the '>' marker across the line range, then
+    # applies inline rules across the line range.
+    static def _BlockquoteRules(node: dict<any>): list<string>
+        var l = node.begin_line == node.end_line
+            ? printf('\%%%dl', node.begin_line)
+            : printf('\%%>%dl\%%<%dl', node.begin_line - 1, node.end_line + 1)
+        var cmds: list<string> = [
+            printf('syntax match aimdBlockquote /%s^\s*>/', l)
+        ]
+        var texts: list<string> = []
+        for child in get(node, 'children', [])
+            if has_key(child, 'lines')
+                texts += child.lines
+            endif
+        endfor
+        cmds += MdSyntaxEmitter._InlineRulesForRange(node.begin_line, node.end_line, join(texts, ' '))
+        return cmds
+    enddef
+
+    # _ListRules: colors the list marker (-, *, +, or N.) across the item line
+    # range, then applies inline rules across the line range.
+    static def _ListRules(node: dict<any>): list<string>
+        var l = node.begin_line == node.end_line
+            ? printf('\%%%dl', node.begin_line)
+            : printf('\%%>%dl\%%<%dl', node.begin_line - 1, node.end_line + 1)
+        var cmds: list<string> = [
+            printf('syntax match aimdListMarker /%s^\s*\([-*+]\|\d\+\.\)\s\+/', l)
+        ]
+        var texts: list<string> = []
+        for item in get(node, 'items', [])
+            if has_key(item, 'text')
+                texts->add(item.text)
+            endif
+        endfor
+        cmds += MdSyntaxEmitter._InlineRulesForRange(node.begin_line, node.end_line, join(texts, ' '))
+        return cmds
+    enddef
+
+    # _TableRules: colors pipe delimiters across the table line range. The
+    # separator line (---|---) was consumed by MdParser to build
+    # alignments and has no AST node - leaving it uncolored is cleaner
+    # than a defensive regex to find it again. Inline rules color cells.
+    static def _TableRules(node: dict<any>): list<string>
+        var l = node.begin_line == node.end_line
+            ? printf('\%%%dl', node.begin_line)
+            : printf('\%%>%dl\%%<%dl', node.begin_line - 1, node.end_line + 1)
+        var cmds: list<string> = [
+            printf('syntax match aimdTablePipe /%s|/', l)
+        ]
+        var texts: list<string> = copy(get(node, 'header', []))
+        for row in get(node, 'rows', [])
+            texts += row
+        endfor
+        cmds += MdSyntaxEmitter._InlineRulesForRange(node.begin_line, node.end_line, join(texts, ' '))
+        return cmds
+    enddef
+
+    # _CodeBlockRules: one syntax region per codeblock node, line-range
+    # constrained via \%Nl so two blocks never bleed into each other.
+    # u.ResolveLang() corrects fence tags that differ from Vim filetype
+    # names (e.g. 'vim9script' -> 'vim', 'py' -> 'python').
+    # Syntax files are included once per unique language across the entire
+    # render pass (tracked via `included_langs`) to prevent duplicate cluster
+    # definitions and keep screen redraws fast.
+    # 'silent!' swallows errors for unknown/misspelled tags.
+    # 'keepend' prevents an embedded language's own multi-line regions
+    # from growing past this block's closing fence.
+    # \%Nl alone anchors to the line; ^ after \%Nl is a literal ^ that
+    # breaks the match (fixed from the old buffer-wide approach).
+    static def _CodeBlockRules(node: dict<any>, idx: number, included_langs: dict<bool>): list<string>
+        var cmds: list<string> = []
+        var start = node.begin_line
+        var end = node.end_line
+        var resolved = u.ResolveLang(node.lang)
+        var region = printf('aimdFenced%d', idx)
+        var contains = ''
+
+        if !empty(resolved)
+            var cluster = printf('aimdLang_%s', MdSyntaxEmitter._SafeGroupSuffix(resolved))
+            if !has_key(included_langs, resolved)
+                cmds->add(printf('silent! syntax include @%s syntax/%s.vim', cluster, resolved))
+                cmds->add('unlet! b:current_syntax')
+                included_langs[resolved] = true
+            endif
+            contains = printf(' contains=@%s', cluster)
+        endif
+
+        cmds->add(printf(
+            'syntax region %s matchgroup=aimdCodeFence'
+            .. ' start=/\%%%dl```/ end=/\%%%dl```/ keepend%s',
+            region, start, end, contains))
+
+        if empty(resolved)
+            cmds->add(printf('highlight default link %s aimdCodeBlock', region))
+        endif
+
+        return cmds
+    enddef
+
+    # _RenderNode: dispatches to the appropriate rule-builder for one
+    # AST node. Mirrors MdHtmlEmitter._RenderNode's dispatch structure.
+    # 'turn' nodes (chat-log wrappers) and 'list' nodes recurse into
+    # their children.
+    # codeblock_idx is threaded through to give each codeblock region a
+    # unique name; returned (incremented) so the caller tracks the count
+    # across siblings.
+    static def _RenderNode(node: dict<any>, codeblock_idx: number, included_langs: dict<bool>): list<any>
+        # Returns [cmds: list<string>, next_codeblock_idx: number]
+        var cmds: list<string> = []
+        var cb_idx = codeblock_idx
+
+        if node.type == 'heading'
+            cmds += MdSyntaxEmitter._HeadingRules(node)
+        elseif node.type == 'hr'
+            cmds += MdSyntaxEmitter._HRRules(node)
+        elseif node.type == 'paragraph'
+            cmds += MdSyntaxEmitter._ParagraphRules(node)
+        elseif node.type == 'blockquote'
+            cmds += MdSyntaxEmitter._BlockquoteRules(node)
+        elseif node.type == 'list'
+            cmds += MdSyntaxEmitter._ListRules(node)
+            var items: list<dict<any>> = get(node, 'items', [])
+            for item in items
+                if has_key(item, 'children')
+                    var children: list<dict<any>> = item.children
+                    for child in children
+                        var result = MdSyntaxEmitter._RenderNode(child, cb_idx, included_langs)
+                        cmds += result[0]
+                        cb_idx = result[1]
+                    endfor
+                endif
+            endfor
+        elseif node.type == 'table'
+            cmds += MdSyntaxEmitter._TableRules(node)
+        elseif node.type == 'codeblock'
+            cmds += MdSyntaxEmitter._CodeBlockRules(node, cb_idx, included_langs)
+            cb_idx += 1
+        elseif node.type == 'turn'
+            for child in node.children
+                var result = MdSyntaxEmitter._RenderNode(child, cb_idx, included_langs)
+                cmds += result[0]
+                cb_idx = result[1]
+            endfor
+        endif
+
+        return [cmds, cb_idx]
+    enddef
+
+    # Render: walks the MdParser AST and returns the full ordered list of
+    # Ex commands to syntax-highlight the buffer. Callers execute() each
+    # one in order against the target buffer, then assign:
+    #   b:current_syntax = 'aimd'
+    # themselves (bare assignment can't be execute()'d from vim9script,
+    # E1126). Leads with 'syntax clear' so re-rendering after content
+    # changes starts from a clean slate.
+    # 'syntax sync fromstart' is placed at the end so foreign included
+    # syntax files (e.g. vim.vim, c.vim) cannot override buffer synchronization.
+    static def Render(ast: list<dict<any>>): list<string>
+        var cmds: list<string> = [
+            'silent! syntax clear',
+            'unlet! b:current_syntax',
+        ]
+        cmds += MdSyntaxEmitter._HighlightGroups()
+
+        var included_langs: dict<bool> = {}
+        var cb_idx = 0
+        for node in ast
+            var result = MdSyntaxEmitter._RenderNode(node, cb_idx, included_langs)
+            cmds += result[0]
+            cb_idx = result[1]
+        endfor
+
+        cmds->add('syntax sync fromstart')
+        return cmds
     enddef
 
 endclass

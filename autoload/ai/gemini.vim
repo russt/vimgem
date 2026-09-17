@@ -1,3 +1,5 @@
+" Copyright (c) 2025-2026 Russ Tremain.
+" Released under the MIT License. See LICENSE file for details.
 vim9script
 
 # autoload/ai/gemini.vim

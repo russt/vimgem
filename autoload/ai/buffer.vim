@@ -1,4 +1,5 @@
-"use vim9script only:
+" Copyright (c) 2025-2026 Russ Tremain.
+" Released under the MIT License. See LICENSE file for details.
 vim9script
 
 # autoload/ai/buffer.vim
@@ -11,7 +12,7 @@ vim9script
 import './config.vim' as Cfg
 import './md.vim' as Md
 import './md_syntax.vim' as Syntax
-import './util.vim' as Util
+import './util.vim' as u
 
 # Marker delimiting the start of a new question in an :AIChat buffer.
 # Kept as a script-level constant so the create/append/lookup methods
@@ -82,15 +83,32 @@ export class AIBuffer
     # calls this again after adding a new turn - since Render() always
     # starts with a `syntax clear`.
     def ApplyMarkdownHighlighting()
-        for cmd in Syntax.MdSyntaxEmitter.Render(getline(1, '$'))
+        var lines = getline(1, '$')
+        var ast = Md.MdParser.new().Parse(lines)
+        for cmd in Syntax.MdSyntaxEmitter.Render(ast)
             execute cmd
         endfor
-        # Not part of Render()'s command list: `:let`/bare-assignment
-        # Ex-command strings can't be execute()'d from a vim9script
-        # (E1126 Cannot use :let in Vim9 script) - only real assignment
-        # statements like this one can set a buffer-local variable
-        # here.
         b:current_syntax = 'aimd'
+    enddef
+
+    # ApplyMarkdownHighlightingToBuf: like ApplyMarkdownHighlighting but
+    # works on any buffer by window ID, not just the current buffer.
+    # Used by ai.vim's BufWinEnter *.md autocmd for standalone markdown
+    # files that have no chat session context.
+    # win_execute() runs each syntax command in the context of the window
+    # displaying the target buffer, ensuring syntax rules are applied to
+    # the right buffer regardless of which window is currently active.
+    def ApplyMarkdownHighlightingToBuf(buf: number)
+        var winid = bufwinid(buf)
+        if winid == -1
+            return
+        endif
+        var lines = getbufline(buf, 1, '$')
+        var ast = Md.MdParser.new().Parse(lines)
+        for cmd in Syntax.MdSyntaxEmitter.Render(ast)
+            win_execute(winid, cmd)
+        endfor
+        setbufvar(buf, 'current_syntax', 'aimd')
     enddef
 
     def SetContent(lines: list<string>)
@@ -251,7 +269,7 @@ export class AIBuffer
     # after each AppendHistoryTurn only the new user+assistant pair is
     # appended to the already-open buffer (no full re-parse needed).
     #
-    # Pretty-printing is done by Util.PrettyJson (jq -M . + post-
+    # Pretty-printing is done by u.PrettyJson (jq -M . + post-
     # processing to expand embedded newlines to real display lines
     # aligned at the value column). Each turn pair is enclosed in its
     # own [ ] array brackets, making them easy to navigate with %.
@@ -292,7 +310,7 @@ export class AIBuffer
 
             # Encode this pair as a JSON array and pretty-print it.
             var raw = json_encode(pair)
-            var pretty = Util.PrettyJson([raw])
+            var pretty = u.PrettyJson([raw])
             if empty(pretty)
                 # PrettyJson failed (jq error or not available); fall
                 # back to raw compact encoding so the caller still gets
@@ -554,7 +572,7 @@ export class AIBuffer
             var html = Md.MdVim.new().ParseMarkdown(getline(1, '$'))
             writefile(html, this.HtmlPath(b:ai_chat_id))
         catch
-            Util.DBG(1, 'MaybeRenderHtml: failed for chat %s: %s', b:ai_chat_id, v:exception)
+            u.DBG(1, 'MaybeRenderHtml: failed for chat %s: %s', b:ai_chat_id, v:exception)
         endtry
     enddef
 
@@ -575,7 +593,36 @@ export class AIBuffer
     # the browser process outlives Vim and nothing here waits on it or
     # captures its output. Untested beyond mac by me - error message
     # says so on the paths that couldn't be verified here.
+    #
+    # If html_display_url is configured, POST the html file to that
+    # server (e.g. a local vimgem-server instance) rather than opening
+    # it directly. The server receives the raw html and calls open(1).
+
     static def _LaunchInBrowser(path: string): dict<any>
+        var display_url = get(g:, 'ai_html_display_url', '')
+        if !empty(display_url)
+            var curl_cmd = 'curl -s -X POST -H "Content-Type: text/html" --data-binary '
+                .. shellescape('@' .. path) .. ' ' .. shellescape(display_url)
+            u.DBG(5, '_LaunchInBrowser: POST cmd="%s"', curl_cmd)
+            var response = system(curl_cmd)
+            var exit_code = v:shell_error
+            if exit_code != 0
+                u.DBG(5, '_LaunchInBrowser: curl failed exit=%d response="%s"', exit_code, response)
+                var reason = exit_code == 7  ? $'connection refused - is the server running at {display_url}?'
+                           : exit_code == 6  ? $'could not resolve host - check your ai_html_display_url setting'
+                           : exit_code == 28 ? 'connection timed out'
+                           : $'curl error {exit_code}'
+                echohl ErrorMsg
+                echom $'vimgem: html display failed - {reason}'
+                echohl None
+                return {ok: false, error: reason}
+            endif
+            u.DBG(5, '_LaunchInBrowser: curl succeeded')
+            return {ok: true}
+        endif
+
+        u.DBG(5, '_LaunchInBrowser: RENDER LOCALLY - display_url="%s"', display_url)
+
         var cmd: list<string> = []
         if has('mac')
             cmd = ['open', path]
@@ -598,11 +645,7 @@ export class AIBuffer
     enddef
 
     # Opens the rendered HTML for chat_id in the OS default browser.
-    # Renders on the fly if the .html sidecar is missing, or older than
-    # the .md log it should reflect - covers chats from before
-    # MaybeRenderHtml existed, or resumed sessions where
-    # g:ai_chat_html_autosave was off - so :AIChatDisplay never shows
-    # stale or nonexistent output, independent of that autosave setting.
+    # always renders, to avoid stale encoding errors.  RT 09/06/26
     def OpenHtmlInBrowser(chat_id: string): dict<any>
         var md_path = this.LogPath(chat_id)
         if !filereadable(md_path)
@@ -610,15 +653,28 @@ export class AIBuffer
         endif
 
         var html_path = this.HtmlPath(chat_id)
-        if !filereadable(html_path) || getftime(html_path) < getftime(md_path)
-            try
-                var html = Md.MdVim.new().ParseMarkdown(readfile(md_path))
-                writefile(html, html_path)
-            catch
-                return {ok: false, error: $'failed to render chat: {v:exception}'}
-            endtry
-        endif
+        try
+            var html = Md.MdVim.new().ParseMarkdown(getline(1, '$'))
+            writefile(html, html_path)
+        catch
+            return {ok: false, error: $'failed to render chat: {v:exception}'}
+        endtry
 
+        return AIBuffer._LaunchInBrowser(html_path)
+    enddef
+
+    # Opens the current buffer's markdown content as HTML in the OS
+    # default browser. Reads directly from the buffer via getline(),
+    # so unsaved changes are included in the render. HTML is written
+    # to a tempfile (not a permanent sidecar - there's no chat_id here).
+    def OpenMarkdownInBrowser(): dict<any>
+        var html_path = tempname() .. '.html'
+        try
+            var html = Md.MdVim.new().ParseMarkdown(getline(1, '$'))
+            writefile(html, html_path)
+        catch
+            return {ok: false, error: $'failed to render markdown: {v:exception}'}
+        endtry
         return AIBuffer._LaunchInBrowser(html_path)
     enddef
 

@@ -1,4 +1,5 @@
-"use vim9 script only:
+" Copyright (c) 2025-2026 Russ Tremain.
+" Released under the MIT License. See LICENSE file for details.
 vim9script
 
 # autoload/ai/md.vim
@@ -48,7 +49,8 @@ import './md_html.vim' as Html
 #    rows: list<list<string>>, begin_line: number, end_line: number}
 #   {type: 'list', ordered: bool, items: list<dict<any>>, begin_line: number, end_line: number}
 #       item: {text: string, checked: bool (optional),
-#              children: list<dict<any>> (optional, nested 'list' nodes)}
+#              children: list<dict<any>> (optional, nested list nodes or
+#              codeblocks/paragraphs that immediately follow the item)}
 # 'text'/'lines' fields hold RAW markdown - inline formatting (bold,
 # links, code spans, ...) is applied later, by the emitter.
 # ---------------------------------------------------------------------
@@ -84,6 +86,10 @@ export class MdParser
     # {node: <list node dict>, indent: number, container: <list<dict> this
     # list node was appended into, so a same-depth type switch can insert
     # a sibling in the right place>}.
+    # When list_stack is non-empty, _AddNode attaches block elements
+    # (codeblocks, paragraphs) to the last item's children rather than
+    # the turn/top-level container - proximity-based containment with no
+    # indentation counting required.
     var list_stack: list<dict<any>> = []
 
     # ---- Static parsing helpers (no instance state) ------------------
@@ -126,6 +132,26 @@ export class MdParser
     # ---- Instance flush / close helpers -------------------------------
 
     def _AddNode(node: dict<any>)
+        # If a list is open and has at least one item, block elements that
+        # immediately follow (codeblocks, paragraphs) attach to that item's
+        # children rather than to the turn/top-level container. This implements
+        # proximity-based containment: no indentation counting required - if a
+        # block follows a list item with at most one blank line between them,
+        # it belongs to that item. Indented fences are also handled correctly
+        # since fence detection now uses '^\s*```'.
+        if !empty(this.list_stack)
+            var items = this.list_stack[-1].node.items
+            if !empty(items)
+                # Modify via index, not a local copy - vim9script dicts are
+                # copied on assignment so items[-1].key is the only safe way
+                # to mutate the actual list entry in place.
+                if !has_key(items[-1], 'children')
+                    items[-1].children = []
+                endif
+                items[-1].children->add(node)
+                return
+            endif
+        endif
         if !empty(this.active_turn)
             this.active_turn.children->add(node)
         else
@@ -311,13 +337,15 @@ export class MdParser
                 g:DBG(2, 'MdParser: opened %s turn at line %d', role, current_line_num)
             endif
 
-            # Fenced code block handling (```)
-            if line =~ '^```'
+            # Fenced code block handling (```). Fence may be indented
+            # (e.g. inside a list item) - match with '^\s*```'. Lang tag
+            # is extracted after the backticks regardless of indentation.
+            if line =~ '^\s*```'
                 if this.in_code
                     this._FlushFencedCode(current_line_num)
                 else
-                    this._CloseBlocks('', current_line_num)
-                    this.code_lang = trim(line[3 :])
+                    this._CloseBlocks('list', current_line_num)
+                    this.code_lang = trim(matchstr(line, '```\zs.*'))
                     this.in_code = true
                     this.code_lines = []
                     this.code_begin_line = current_line_num
@@ -340,7 +368,7 @@ export class MdParser
 
             # Blank lines reset active block elements
             if line =~ '^\s*$'
-                this._CloseBlocks('', current_line_num)
+                this._CloseBlocks('list', current_line_num)
                 if !empty(this.active_turn)
                     this.active_turn.end_line = current_line_num
                 endif
@@ -545,7 +573,7 @@ export class MdParser
 
             # Default Paragraph Line
             if empty(this.p_lines)
-                this._CloseBlocks('paragraph', current_line_num)
+                this._CloseBlocks('list', current_line_num)
                 this.p_begin_line = current_line_num
             endif
             this.p_lines->add(line)

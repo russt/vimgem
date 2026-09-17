@@ -1,3 +1,5 @@
+" Copyright (c) 2025-2026 Russ Tremain.
+" Released under the MIT License. See LICENSE file for details.
 vim9script
 
 # autoload/ai/config.vim
@@ -62,6 +64,7 @@ export class AIConfig
     public var always_review_received_files: bool
     public var vimgem_version: string
     public var vimgem_chat_home: string
+    public var html_display_url: string
 
     public var gemini_model: string
     public var gemini_api_version: string
@@ -88,7 +91,7 @@ export class AIConfig
         'claude_model', 'claude_api_version', 'claude_api_key',
         'openai_model', 'openai_api_key', 'openai_base_url',
         'show_prompt', 'curl_trace_level', 'always_review_received_files',
-        'vimgem_version', 'vimgem_chat_home',
+        'vimgem_version', 'vimgem_chat_home', 'html_display_url',
     ]
 
     def new()
@@ -130,6 +133,8 @@ export class AIConfig
         this.claude_model = get(g:, 'claude_model', PROVIDER_MODEL_DEFAULTS.claude)
         this.claude_api_version = get(g:, 'claude_api_version', '2023-06-01')
         this.claude_api_key = $ANTHROPIC_API_KEY
+
+        this.html_display_url = get(g:, 'ai_html_display_url', '')
 
         this.openai_base_url = get(g:, 'openai_base_url', 'http://localhost:9090')
         this.openai_model = get(g:, 'openai_model', PROVIDER_MODEL_DEFAULTS.openai)
@@ -321,6 +326,7 @@ export class AIConfig
         elseif key == 'always_review_received_files' | return this.always_review_received_files ? '1' : '0'
         elseif key == 'vimgem_version'     | return this.vimgem_version
         elseif key == 'vimgem_chat_home'   | return this.vimgem_chat_home
+        elseif key == 'html_display_url'   | return this.html_display_url
         else
             echoerr $"Unknown config key '{key}'. Run :AISet with no args to list valid keys."
             return ''
@@ -345,6 +351,7 @@ export class AIConfig
         elseif key == 'curl_trace_level'   | this.curl_trace_level = str2nr(value)
         elseif key == 'always_review_received_files' | this.always_review_received_files = (value == '1' || value == 'on')
         elseif key == 'vimgem_version'     | this.vimgem_version = value
+        elseif key == 'html_display_url'   | this.html_display_url = value
         elseif key == 'vimgem_chat_home'
             this.vimgem_chat_home = value
             if !empty(value)
@@ -419,6 +426,8 @@ export class AIConfig
             '  let g:ai_curl_trace_level = 9',
             '  let g:always_review_received_files = 1',
             '  let g:vimgem_chat_home = "~/.vimgem/ai-chat"',
+            '  let g:ai_html_display_url = ""   " e.g. \"http://127.0.0.1:8765\" for remote browser display',
+            '  let g:set_debug_levels = "1,5"  " e.g. \"1-4\" or \"1,5\" to enable debug tracing',
         ]
     enddef
 endclass

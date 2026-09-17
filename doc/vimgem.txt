@@ -1,7 +1,7 @@
 *vimgem.txt* *vimgem*    Multi-provider AI assistant for Vim
 
 
-                VIMGEM REFERENCE MANUAL 0.1.260827
+                VIMGEM REFERENCE MANUAL 0.1.260914
                         by Russ Tremain
 
         Query, chat with, or have code reviewed by an AI model
@@ -25,7 +25,7 @@ CONTENTS                                                       *vimgem-contents*
     8. Providers ........................................ |ai-providers|
     9. Debugging ........................................ |ai-debugging|
    10. Troubleshooting .................................. |ai-troubleshooting|
-
+   11. LICENSE .......................................... |vimgem-license|
 ==============================================================================
 1. Introduction                                            *ai-introduction*
 
@@ -645,5 +645,10 @@ MaybeRenderHtml errors silently swallowed ~
         debug level 1 to see them: the error and the chat-id are logged
         via `Util.DBG('MaybeRenderHtml: ...')`.
 
+==============================================================================
+LICENSE                                                       *vimgem-license*
+
+Copyright (c) 2025-2026 Russ Tremain.
+Released under the MIT License. See LICENSE file for details.
 ==============================================================================
 vim:tw=78:ts=8:ft=help:norl:

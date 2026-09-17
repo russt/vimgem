@@ -1,3 +1,5 @@
+" Copyright (c) 2025-2026 Russ Tremain.
+" Released under the MIT License. See LICENSE file for details.
 vim9script
 
 # autoload/ai/core.vim
@@ -343,6 +345,19 @@ export class AIPlugin
             return
         endif
         echo $"Opened chat '{target}' in browser."
+    enddef
+
+    # :AIMarkdownDisplay - render the current buffer's markdown content
+    # to HTML and open it in the OS default browser. Reads directly from
+    # the buffer (not the file on disk), so unsaved changes are included.
+    # Works on any buffer, not just registered chat sessions.
+    def MarkdownDisplay()
+        var result = this.buffer.OpenMarkdownInBrowser()
+        if !result.ok
+            echoerr $"AIMarkdownDisplay: {result.error}"
+            return
+        endif
+        echo "Opened markdown in browser."
     enddef
 
     def ChatClear()
