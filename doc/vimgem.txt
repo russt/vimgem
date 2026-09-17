@@ -1,0 +1,518 @@
+*vimgem.txt* *vimgem*    Multi-provider AI assistant for Vim
+
+
+                VIMGEM REFERENCE MANUAL 0.1.260817
+                        by Russ Tremain
+
+        Query, chat with, or have code reviewed by an AI model
+        of your choosing, all without leaving Vim.
+
+==============================================================================
+CONTENTS                                                       *vimgem-contents*
+
+    1. Introduction ..................................... |ai-introduction|
+    2. Requirements ..................................... |ai-requirements|
+    3. Quick start ...................................... |ai-quickstart|
+    4. Commands ......................................... |ai-commands|
+        4.1 Querying .................................... |ai-querying|
+        4.2 Selection-driven commands ................... |ai-selection|
+        4.3 Chat sessions ............................... |ai-chat-cmds|
+        4.4 Models and info ............................. |ai-models-info|
+        4.5 Settings .................................... |ai-settings-cmds|
+    5. Reference directives ............................. |ai-references|
+    6. Chat sessions in depth............................ |ai-chat|
+    7. Configuration .................................... |ai-configuration|
+    8. Providers ........................................ |ai-providers|
+    9. Troubleshooting .................................. |ai-troubleshooting|
+
+==============================================================================
+1. Introduction                                            *ai-introduction*
+
+This plugin lets you send prompts to an AI model (Google Gemini, Anthropic
+Claude, or any OpenAI-compatible server - local or hosted) directly from
+Vim, and get the response back in a scratch buffer, a persistent multi-turn
+chat buffer, or written straight into a file/buffer of your choosing.
+
+Core capabilities:
+  - One-shot queries (|:AIQuery|), plus selection-driven "explain this" /
+    "review this" / "ask about this" commands.
+  - A persistent, resumable, multi-turn chat (|:AIChat| /
+    |:AIChatSend|), backed by both a human-readable transcript and a JSON
+    conversation history.
+  - Reference directives that pull register, buffer, or file content
+    straight into a prompt (|ai-references|), including whole-file
+    round-trips where the model's reply is written back to a real file.
+  - Three interchangeable providers behind one interface: `gemini`,
+    `claude`, and `openai` (any `/v1/chat/completions`-compatible server).
+    Switch with |:AIProvider| at any time, mid-chat included.
+
+The plugin is organized as a thin `plugin/ai.vim` command layer over an
+`autoload/ai/` library (config, provider interface + one file per provider,
+buffer/session management, and prompt processing), so adding a new provider
+never requires touching the orchestrator.
+
+==============================================================================
+2. Requirements                                            *ai-requirements*
+
+  - `curl` must be installed and on `$PATH`. The plugin refuses to load
+    (with an |:echoerr|) if it isn't found.
+  - Vim with |vim9script| support.
+  - At least one provider configured with credentials:
+      - Gemini:  `$GOOGLE_API_KEY` environment variable
+      - Claude:  `$ANTHROPIC_API_KEY` environment variable
+      - OpenAI-compatible: a reachable `base_url` (an API key is usually
+        optional for local servers)
+
+==============================================================================
+3. Quick start                                              *ai-quickstart*
+>
+    " In .vimrc, pick a default provider (optional - defaults to gemini)
+    let g:ai_provider = "claude"
+
+    " Make sure the matching API key is exported in your shell:
+    "   export ANTHROPIC_API_KEY="sk-ant-..."
+
+    " Ask a one-off question
+    :AIQuery What's the difference between a shallow and deep copy?
+
+    " Explain the code under a visual selection
+    :'<,'>AIExplain
+
+    " Start a persistent chat
+    :AIChat
+    " ... type your question under '## You', then:
+    :AIChatSend
+<
+==============================================================================
+4. Commands                                                  *ai-commands*
+
+------------------------------------------------------------------------------
+4.1 Querying                                                  *ai-querying*
+
+                                                                    *:AIQuery*
+:AIQuery {prompt}      Send {prompt} verbatim to the current provider and
+                        show the response in a new scratch buffer. {prompt}
+                        is required; takes the rest of the command line
+                        (|:command-nargs| `+`), so no quoting is needed.
+
+                                                                 *:AIProvider*
+:AIProvider {name}      Switch the active provider. {name} is one of
+                        `gemini`, `claude`, `openai`. Re-pulls that
+                        provider's model default (if unset) and API key
+                        from `g:`/the environment, in case they changed
+                        since Vim started. Errors (listing valid choices)
+                        if {name} isn't recognized.
+
+------------------------------------------------------------------------------
+4.2 Selection-driven commands                                *ai-selection*
+
+These commands act on a visual selection or an Ex range. Each is defined
+with |:command-range| (not `=%`), so with no selection they default to just
+the current line - the common case is a visual selection, e.g. `:'<,'>`.
+
+                                                                      *:AIAsk*
+:[range]AIAsk           Send the selected lines as a prompt, after
+                        expanding any |ai-references| ({='a=},
+                        {=1,10<'a>=}, etc.) they contain. Aborts with an
+                        error (and sends nothing) if a reference fails to
+                        resolve.
+
+                                                                  *:AIExplain*
+:[range]AIExplain       Ask the AI to explain the selected code. Wraps the
+                        selection in a canned prompt asking for: overall
+                        purpose/design, key algorithms/data structures,
+                        implementation details, and edge cases. Refuses to
+                        run in a `nofile` buffer (e.g. the plugin's own
+                        output buffers).
+
+                                                                   *:AIReview*
+:[range]AIReview        Ask the AI to review the selected code. Wraps the
+                        selection in a canned prompt asking for: code
+                        quality, potential bugs, performance, best
+                        practices, and security concerns - "based strictly
+                        on the provided code", not invented scenarios.
+                        Refuses to run in a `nofile` buffer.
+
+                                                               *:AIReviewFile*
+:AIReviewFile           Same as |:AIReview|, but reviews the entire current
+                        file rather than a selection. Errors if the file
+                        is empty or the buffer is `nofile`.
+
+------------------------------------------------------------------------------
+4.3 Chat sessions                                            *ai-chat-cmds*
+
+See also |ai-chat| for the full session-lifecycle explanation.
+
+                                                                     *:AIChat*
+:AIChat                 Open a new persistent chat buffer (markdown,
+                        backed by a file under |g:ai_chat_dir|). Type your
+                        question under the `## You` heading, then run
+                        |:AIChatSend|.
+
+                                                                 *:AIChatSend*
+:[range]AIChatSend      Send the new text since the last `## You` marker
+                        as the next turn, including the full prior
+                        conversation history. Defined with `-range=%`, so
+                        a plain `:AIChatSend` with no selection covers
+                        everything typed since that marker; an explicit
+                        `:'<,'>AIChatSend` also works. Errors if not run
+                        inside a chat buffer (`b:ai_chat` unset) - use
+                        |:AIChat| or |:AIChatResume| first.
+                        Supports |ai-references| directives, including the
+                        two chat-only write-target forms `{=>name=}` and
+                        `{=>*=}`.
+
+                                                                *:AIChatClear*
+:AIChatClear            Clear this session's JSON history (the API-facing
+                        conversation context) so future turns stop
+                        resending everything before this point. The
+                        visible transcript is left untouched.
+
+                                                              *:AIChatHistory*
+:AIChatHistory          List all saved chat sessions (most recently
+                        modified first) in a new buffer: id, last-modified
+                        time, line count, model, and an excerpt of the
+                        first question. Put the cursor on a line and run
+                        |:AIChatResume| or |:AIChatDelete|.
+
+                                                               *:AIChatResume*
+:[range]AIChatResume    Resume a saved chat. Run with the cursor on a
+                        session line from |:AIChatHistory|, it resumes
+                        that session; run anywhere else (or if the line
+                        isn't a valid session line), it resumes the most
+                        recently modified session. Defined with `-range`
+                        (current line by default). Errors if no matching
+                        session is found.
+
+                                                               *:AIChatDelete*
+:[range]AIChatDelete    Delete the saved session (both the `.md` transcript
+                        and the `.json` history) under the cursor. Unlike
+                        |:AIChatResume|, there is no "most recent" fallback
+                        - the cursor must be on a valid session line (run
+                        this from |:AIChatHistory|), or it errors out.
+                        Refreshes the history listing in place afterward.
+
+------------------------------------------------------------------------------
+4.4 Models and info                                          *ai-models-info*
+
+                                                                   *:AIModels*
+:AIModels               List models available from the current provider in
+                        a new buffer. Put the cursor on a model line and
+                        run |:AIModel| to switch to it. (Claude has no
+                        public models endpoint, so this returns a curated,
+                        hardcoded list instead of a live query.)
+
+                                                                    *:AIModel*
+:[range]AIModel [name]  Set the current provider's model to {name}. With
+                        no {name}: if run with the cursor on a model line
+                        from an |:AIModels| listing, switches to that
+                        model; otherwise just reports the current model.
+                        Defined with `-range` (current line by default),
+                        which is what makes "cursor on a model line, run
+                        :AIModel" work. Warns (but does not block) if the
+                        given name looks like it belongs to a different
+                        provider's naming convention (e.g. setting a
+                        `claude-*` name while `openai` is active).
+
+                                                                     *:AIInfo*
+:AIInfo                 Show current configuration, the active provider's
+                        status (model, API version, key set/not-set), the
+                        full command reference, and example `.vimrc`
+                        settings for every provider - all in one buffer.
+
+------------------------------------------------------------------------------
+4.5 Settings                                              *ai-settings-cmds*
+
+                                                                    *:AIDebug*
+:AIDebug [on|off]       Toggle or set debug mode. While on, every curl
+                        command is echoed via |:messages| before it runs,
+                        with API keys redacted. No argument toggles the
+                        current state.
+
+                                                                   *:AIPrompt*
+:AIPrompt [on|off]      Toggle or set whether |:AIQuery|/|:AIAsk|/etc.
+                        responses include the original prompt (and a
+                        provider/model header) above the response, or just
+                        the bare response text. No argument toggles.
+
+                                                           *:AIReviewReceived*
+:AIReviewReceived [on|off]
+                        Get or set whether a `{=>*=}` block tagged with a
+                        real filename (via a `{=<name=}` round-trip, see
+                        |ai-references|) opens in a review tab instead of
+                        being written straight to disk. Unlike |:AIDebug|/
+                        |:AIPrompt|, no argument only *reports* the
+                        current value - it never toggles, since this flag
+                        is the one guard against silently clobbering files
+                        on disk. Has no effect on UNIDENTIFIED blocks
+                        (blocks with no matching `[ID: name]` tag), which
+                        always open as `[AI-output-N]` review tabs
+                        regardless of this setting.
+
+                                                                      *:AIUrl*
+:AIUrl [url]            Get or set `g:openai_base_url` (the `openai`
+                        provider only - errors if another provider is
+                        active). No trailing slash, no path suffix, e.g.
+                        `http://localhost:9090` or `https://api.openai.com`.
+
+                                                                      *:AISet*
+:AISet [key] [value]    Generic get/set for any configurable key (model,
+                        API version, API key, or base URL per provider,
+                        plus `show_prompt`/`debug`/
+                        `always_review_received_files`). Tab-completes
+                        {key}.
+                          - No args: list every valid key.
+                          - {key} only: show its current value.
+                          - {key} and {value}: set it.
+                        Unlike |:AIModel|, this does NOT check the value
+                        against the current provider - useful for
+                        pre-configuring a provider before switching to it.
+                        Values are literal text, NOT evaluated like |:let|
+                        - do not quote strings:
+>
+                            Right: :AISet gemini_api_version v1beta
+                            Wrong: :AISet gemini_api_version "v1beta"
+<
+                        (the wrong form sets the value to the 8 literal
+                        characters `"v1beta"`, quotes included, which
+                        breaks the API request.)
+
+==============================================================================
+5. Reference directives                                    *ai-references*
+
+Every `{=...=}` directive below is expanded (or stripped) in the ORIGINAL
+prompt text you type, in a single pass - content that comes back FROM the
+model (an old reply, a code sample) is never re-scanned for further
+directives, even if it happens to contain matching-looking text.
+
+If any single reference fails to resolve (empty register, unreadable file,
+bad range), the WHOLE expansion is aborted and nothing is sent - rather
+than silently sending a half-expanded prompt.
+
+Two families exist side by side and never collide (direct forms require
+`<` or `>` immediately after `{=`, which the register forms never produce):
+
+Register-indirected (works with |:AIAsk| and |:AIChatSend|) ~
+
+                                                             *ai-ref-register*
+{='a=}                  Insert the contents of register `a into the
+                        chat/prompt stream
+
+{=1,10<'a>=}            Send lines 1-10 of the buffer or file whose NAME
+                        is stored in register `a` (yank a filename into
+                        the register first). Looks for an already-open
+                        buffer by exact name first, then falls back to
+                        reading the file straight off disk
+                        Use `$` for "last line", e.g. `1,$<'a>`.
+
+Direct-name, :AIChat-only (whole-file only, no line ranges) ~
+
+                                                               *ai-ref-direct*
+{=<name=}               Insert the WHOLE contents of buffer/file `name`
+                        (an open buffer by exact name, else read from
+                        disk). Supports globs, e.g. `{=<july25/*.vim=}`,
+                        to inline every matching file at once. Each file
+                        is wrapped with an instruction telling the model:
+                        if - and only if - it returns an updated version
+                        of this file, open that portion of the reply with
+                        an exact `[ID: name]` marker line, immediately
+                        followed by the code, closed with `[END ID: name]`.
+                        This is what lets a LATER `{=>*=}` turn route a
+                        reply straight back to the real file (see below)
+                        instead of a generic unlabeled buffer.
+
+{=>name=}               Marks where the AI's reply (not something to read
+                        now) should be written once it comes back - to
+                        buffer/file `name`, expecting exactly one fenced
+                        code block in the response. Only the code (not the
+                        model's commentary) is written. `{=>new(scratch)=}`
+                        targets a fresh scratch buffer.
+
+{=>*=}                  Wildcard write-target: every fenced code block in
+                        the response becomes its own new buffer, left for
+                        you to inspect and save under whatever name you
+                        choose. Used when the number of output files isn't
+                        fixed in advance, or you don't trust the model to
+                        name each block correctly. A block preceded by a
+                        matching `[ID: name]` marker (from an earlier
+                        `{=<name=}` round-trip read in this same
+                        conversation) is instead routed straight to that
+                        real file/buffer - see |:AIReviewReceived| for how
+                        that write is gated.
+
+{=> dir/*=}             Same wildcard form as `{=>*=}`, but identified
+                        blocks that get written straight to disk land
+                        under `dir/` (created via `mkdir -p` if needed)
+                        instead of at their bare id-derived path.
+
+Neither write-target directive is ever sent to the model - it's stripped
+from the prompt before expansion; the model never sees plugin syntax.
+
+==============================================================================
+6. Chat sessions in depth                                          *ai-chat*
+
+A chat session is two files under |g:ai_chat_dir|, sharing one
+timestamp-derived id (`chat-<id>.md` / `chat-<id>.json`):
+
+  - `chat-<id>.md` - the human-readable, visible transcript. This is a
+    LOG, not the conversation state: write-target turns show a short
+    summary here (`-> wrote to foo.go (95 lines)`) rather than the full
+    reply, since the full text already lives in the JSON history.
+  - `chat-<id>.json` - a flat JSON array of `{role, text}` turns, the
+    actual API-facing context sent on every subsequent |:AIChatSend|.
+    Always written immediately and in full, regardless of
+    |g:ai_chat_autosave|, since losing it silently would break context
+    continuity on resume.
+
+Each `## You` heading in the transcript carries a timestamp (marking when
+that slot opened - session start, or the previous response's arrival) and
+each `## AI` heading carries the timestamp of when THAT turn's prompt was
+sent, plus the model that answered it - so switching providers/models
+mid-chat (|:AIProvider|, |:AIModel|) still leaves a readable record of
+which model produced which reply.
+
+Chat buffers use `bufhidden=hide` (not the default `wipe` used by
+throwaway query buffers): switching to another file in the same window
+just hides it, recoverable via |:ls|, |:buffer|, or CTRL-^. Reopening a
+`chat-*.md` file directly - via |:e|, netrw, an MRU/fzf plugin, etc. -
+is detected by an autocommand and automatically wires up `b:ai_chat`/
+`b:ai_chat_id`, so it behaves like a resumed session even without running
+|:AIChatResume|.
+
+==============================================================================
+7. Configuration                                          *ai-configuration*
+
+All of the following may be set in your `.vimrc`. Anything set there is
+read once at startup into an `AIConfig` object; most can also be read or
+changed at runtime with |:AISet| (see |ai-commands| for which ones).
+
+Plugin-wide ~
+                                                               *g:ai_provider*
+g:ai_provider           Default provider: `"gemini"`, `"claude"`, or
+                        `"openai"`. Default: `"gemini"`.
+
+                                                               *g:show_prompt*
+g:show_prompt           `1` to include the original prompt (and a
+                        provider/model header) above the response in
+                        output buffers, `0` for bare response text only.
+                        Default: `1`.
+
+                                                                     *g:debug*
+g:debug                 `1` to echo every curl command (via |:messages|,
+                        API keys redacted) before running it. Default: `0`.
+
+                                              *g:always_review_received_files*
+g:always_review_received_files
+                        `1` (default): a `{=>*=}` block tagged with a real
+                        filename opens in a review tab (buftype= so a
+                        plain `:w` just works) instead of writing straight
+                        to disk. `0`: write straight to disk. Has no
+                        effect on unidentified blocks, which always open
+                        as review tabs.
+
+                                                               *g:ai_chat_dir*
+g:ai_chat_dir           Directory where |:AIChat| transcripts and history
+                        are saved. Default: `"~/.vim/ai-chat"`.
+
+                                                          *g:ai_chat_autosave*
+g:ai_chat_autosave      `1` (default) to write the chat's `.md` transcript
+                        to disk after every turn (in addition to session
+                        end/`bufhidden=hide`). Set to `0` to disable. Only
+                        affects the `.md` log; the `.json` history is
+                        always written immediately regardless.
+
+Gemini ~
+                                                              *g:gemini_model*
+g:gemini_model          Model name. Default: `"gemini-3.1-flash-lite"`.
+                                                        *g:gemini_api_version*
+g:gemini_api_version    API version path segment. Default: `"v1"`.
+                                                             *$GOOGLE_API_KEY*
+$GOOGLE_API_KEY         Environment variable holding the API key. Required
+                        for the `gemini` provider to be considered valid.
+
+Claude ~
+                                                              *g:claude_model*
+g:claude_model          Model name. Default: `"claude-sonnet-4-6"`.
+                                                        *g:claude_api_version*
+g:claude_api_version    Value of the `anthropic-version` header. Default:
+                        `"2023-06-01"`.
+                                                          *$ANTHROPIC_API_KEY*
+$ANTHROPIC_API_KEY      Environment variable holding the API key. Required
+                        for the `claude` provider to be considered valid.
+
+OpenAI-compatible ~
+
+Works with any server exposing `POST {base_url}/v1/chat/completions` -
+local (mlx_lm.server, Ollama, LM Studio, vLLM, ...) or api.openai.com
+itself.
+                                                           *g:openai_base_url*
+g:openai_base_url      Server base URL, no trailing slash, no path suffix.
+                       Default: `"http://localhost:9090"`.
+                                                              *g:openai_model*
+g:openai_model         Model name. Default: `""` (empty - the `"model"`
+                       field is omitted from the request entirely, which
+                       matches mlx_lm.server's own example requests and
+                       works for most single-model local servers). Only
+                       multi-model servers (Ollama, vLLM, api.openai.com)
+                       need this set to a real name.
+                                                            *g:openai_api_key*
+g:openai_api_key       API key, sent as `Authorization: Bearer ...` if
+                       non-empty. Falls back to `$OPENAI_API_KEY` if unset.
+                       Optional - most local servers ignore it entirely.
+
+==============================================================================
+8. Providers                                                  *ai-providers*
+
+gemini ~
+        Google Gemini, via the `generativelanguage.googleapis.com`
+        REST API. `:AIModels` performs a live query and filters to
+        models supporting `generateContent`.
+
+claude ~
+        Anthropic Claude, via `api.anthropic.com/v1/messages`. There is
+        no public models-listing endpoint, so `:AIModels` returns a
+        curated, hardcoded list instead of a live query - check
+        https://docs.anthropic.com/claude/docs/models-overview for the
+        latest models.
+
+openai ~
+        Any server implementing the OpenAI chat-completions API shape
+        (`/v1/chat/completions`, `/v1/models`) - local single- or
+        multi-model servers, or api.openai.com itself. `IsValid()` only
+        requires a `base_url`; an API key is optional, since most local
+        servers ignore auth entirely.
+
+All three implement the same `AIProvider` interface (`IsValid`,
+`GenerateContent`, `GenerateChat`, `ListModels`, ...), so |:AIProvider|
+can switch between them - mid-chat included - without the rest of the
+plugin needing to know which one is active.
+
+==============================================================================
+9. Troubleshooting                                        *ai-troubleshooting*
+
+"vim-ai-plugin requires curl to be installed" ~
+        `curl` isn't on `$PATH`. Install it; the plugin does nothing
+        else until it's available.
+
+"Error: GOOGLE_API_KEY environment variable not set." (or ANTHROPIC_*) ~
+        Export the relevant environment variable in your shell (not just
+        `.vimrc` - `$VAR` reads the process environment at Vim startup)
+        and restart Vim, or use |:AISet| to set the `*_api_key` field
+        directly for the current session.
+
+"AIChatSend: not in an AI Chat buffer." ~
+        Run |:AIChat| to start a new session, or |:AIChatResume| to
+        reopen a saved one, before running |:AIChatSend|.
+
+"Warning: '<model>' looks like a <provider> model, but the current
+provider is '<other>'." ~
+        A soft sanity check from |:AIModel| - it's not blocked, just
+        flagged, since custom/local model names can't always be
+        predicted correctly.
+
+Turn debug mode on with |:AIDebug| to see the exact (secret-redacted)
+curl command for any request, which is usually the fastest way to
+diagnose an API error.
+
+==============================================================================
+vim:tw=78:ts=8:ft=help:norl:
