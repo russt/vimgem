@@ -2,12 +2,35 @@
 vim9script
 
 # autoload/ai/core.vim
-# Main Plugin Class
+# AIPlugin - the top-level orchestrator.
 #
-# Thin orchestrator: owns one instance each of AIConfig, every provider,
-# AIBuffer, and AIPrompt, and delegates to them. This is the one file
-# that DOES need to know about every provider (to build the `providers`
-# dict) - individual provider files don't need to know about each other.
+# Owns: one AIConfig, one AIBuffer, one AIPrompt, and a dict of all
+# AIProvider instances (one per supported provider, all created at
+# startup). Commands in plugin/ai.vim delegate directly to methods here;
+# this file never calls back into ai.vim.
+#
+# Design notes:
+#   - GetCurrentProvider() returns the globally-active provider for
+#     non-chat commands (:AIQuery, :AIExplain, etc.). Chat commands
+#     resolve their provider from the ChatSessionInfo registry instead,
+#     via this.config.GetChatSessionForCurrentBuffer().
+#   - Per-chat provider/model/api_version are snapshotted into
+#     ChatSessionInfo at Chat()/ChatResume() time. Global :AIProvider
+#     and :AIModel changes do not affect in-flight chats unless the user
+#     runs those commands from within a chat buffer, in which case both
+#     the global default AND the current chat's snapshot are updated.
+#   - Providers never write to AIConfig. Model/provider selection is
+#     exclusively a core.vim + config.vim concern.
+#   - Providers return dict<any> from GenerateContent/GenerateChat with
+#     keys {ok, text, error, truncated} - core.vim inspects these keys
+#     only, never the text content, to detect errors or truncation.
+#   - The .buffer and .config members are intentionally public so ai.vim
+#     can wire up the BufReadPost and BufWipeout autocmds without needing
+#     dedicated accessor methods.
+#   - Error handling follows the Vim convention: echoerr for unexpected
+#     failures the user needs to know about; plain echo for soft "nothing
+#     to do" feedback; try/catch around every external API call since
+#     GenerateContent/GenerateChat can throw on unexpected response shapes.
 
 import './config.vim' as Cfg
 import './provider.vim' as Provider
@@ -16,6 +39,7 @@ import './claude.vim' as Claude
 import './openai.vim' as OpenAI
 import './buffer.vim' as Buf
 import './prompt.vim' as Prm
+import './util.vim' as Util
 
 export class AIPlugin
     var config: Cfg.AIConfig
@@ -23,6 +47,10 @@ export class AIPlugin
     var buffer: Buf.AIBuffer
     var prompt: Prm.AIPrompt
 
+    # Initialize all subsystems once at plugin load time. Every provider
+    # is instantiated eagerly (not lazily) so a missing import or class
+    # error surfaces immediately at startup rather than the first time a
+    # user tries to switch providers.
     def new()
         this.config = Cfg.AIConfig.new()
         this.providers = {}
@@ -33,22 +61,61 @@ export class AIPlugin
         this.prompt = Prm.AIPrompt.new()
     enddef
 
+    # Returns the globally-active provider. Used only by non-chat
+    # commands (:AIQuery, :AIExplain, :AIReview, :AIReviewFile,
+    # :AIModels, :AIInfo). Chat commands resolve their provider from the
+    # ChatSessionInfo registry to avoid being affected by global changes.
     def GetCurrentProvider(): Provider.AIProvider
         return this.providers[this.config.provider]
     enddef
 
+    # Returns the provider for a specific chat session. Errors (returns
+    # the global provider as a safe fallback) if the session is not found
+    # or the session's provider name is not registered.
+    def GetChatSessionProvider(chat_id: string): Provider.AIProvider
+        var provider_name = this.config.GetChatSessionProvider(chat_id)
+        if empty(provider_name) || !has_key(this.providers, provider_name)
+            echoerr $"GetChatSessionProvider: no registered session for chat '{chat_id}', using global provider."
+            return this.GetCurrentProvider()
+        endif
+        return this.providers[provider_name]
+    enddef
+
+    # Switch the active global provider. If called from within a chat
+    # buffer, also updates that chat's session snapshot and sets the
+    # per-chat model to the new provider's default (since the previous
+    # model name almost certainly does not apply to a different provider).
+    # Emits a message that distinguishes the two cases so the user knows
+    # what changed.
     def SetProvider(provider_name: string)
         if !this.config.SetProvider(provider_name)
             var valid = keys(this.providers)
             echoerr $"Invalid provider. Choose from: {join(valid, ', ')}"
             return
         endif
-        # Delegate the "fill in sensible defaults" logic to the provider
-        # itself - AIPlugin doesn't need to know each provider's fields.
-        this.providers[provider_name].RefreshDefaults()
-        echo $"AI provider set to: {provider_name}"
+
+        var new_provider = this.providers[provider_name]
+        var default_model = new_provider.GetDefaultModel()
+        var session = this.config.GetChatSessionForCurrentBuffer()
+
+        if !empty(session)
+            # Called from a chat buffer: update the session snapshot too.
+            var chat_id = session.chat_id
+            var api_version = this.config.ApiVersionForProvider(provider_name)
+            this.config.UpdateChatSessionProvider(chat_id, provider_name)
+            this.config.UpdateChatSessionModel(chat_id, default_model)
+            this.config.UpdateChatSessionApiVersion(chat_id, api_version)
+            echo $"Provider is now '{provider_name}' for new chats, and for the current chat, model is '{default_model}'. Use :AIModel to change."
+        else
+            echo $"AI provider set to: {provider_name}"
+        endif
     enddef
 
+    # One-shot prompt -> response. The provider is echoed before the
+    # (potentially slow) API call so the user gets immediate feedback
+    # that something is happening. The response is shown in a new scratch
+    # buffer via AIBuffer.DisplayResponse. chat_id is '' for all
+    # one-shot commands; providers fall back to global config model.
     def Query(command_name: string, user_prompt: string)
         if empty(user_prompt)
             echo command_name .. ": Please provide a prompt."
@@ -59,30 +126,55 @@ export class AIPlugin
         echo $"Querying {this.config.provider}..."
 
         try
-            var response = provider.GenerateContent(user_prompt)
-            this.buffer.DisplayResponse(user_prompt, response, provider.GetCurrentModel())
+            var result = provider.GenerateContent(user_prompt, '')
+            if !result.ok
+                echoerr $"Error calling AI API: {result.error}"
+                return
+            endif
+            if get(result, 'truncated', false)
+                echohl WarningMsg
+                echo "Warning: response was truncated before completion."
+                echohl None
+            endif
+            this.buffer.DisplayResponse(user_prompt, result.text, provider.GetDefaultModel())
             echo "AI response received."
         catch
             echoerr "Error calling AI API: " .. v:exception
         endtry
     enddef
 
+    # :AIChat - open a fresh chat buffer backed by a real file under
+    # g:vimgem_chat_home. The buffer is not a throwaway nofile scratch -
+    # it persists across window changes (bufhidden=hide) and autosaves
+    # on every turn. Registers the new session in the ChatSessionInfo
+    # registry, snapshotting the current global provider/model/api_version
+    # so future global changes do not affect this chat.
     def Chat()
         var provider = this.GetCurrentProvider()
-        this.buffer.CreateChat(this.config.provider, provider.GetCurrentModel())
-        echo "AI Chat buffer created. Type under '## You', then :AIChatSend."
+        var provider_name = this.config.provider
+        var model = provider.GetDefaultModel()
+        var api_version = this.config.ApiVersionForProvider(provider_name)
+
+        var chat_id = this.buffer.CreateChat(provider_name, model)
+        var bufnr = bufnr('%')
+        this.config.RegisterChatSession(chat_id, bufnr, provider_name, model, api_version)
+
+        echo $"AI Chat buffer created with provider '{provider_name}', model '{model}'. Type under '## You', then :AIChatSend."
     enddef
 
-    # end_line is normally the end of the buffer - AIChatSend is defined
-    # with -range=% in plugin/ai.vim, so a plain :AIChatSend with no
-    # explicit selection covers everything you've typed. An explicit
-    # :'<,'>AIChatSend still works too.
-    #
-    # Unlike the old design, this does NOT reparse the buffer for
-    # context - GetNewPromptText only pulls out this turn's new question
-    # (everything since the last '## You'), which gets appended to the
-    # persisted JSON history (see AIBuffer.LoadHistory/AppendHistoryTurn)
-    # alongside every prior turn from this session.
+    # :AIChatSend - the core chat-send logic:
+    #   1. Confirm we are in a registered chat buffer.
+    #   2. Locate the new question text (since the last '## You' marker).
+    #   3. Expand any {=...=} references in it.
+    #   4. Strip any {=>...=} write-target directive, appending the
+    #      appropriate instruction to the prompt if present.
+    #   5. Resolve provider and model from the ChatSessionInfo registry
+    #      (never from global config) so in-flight chats are immune to
+    #      global :AIProvider / :AIModel changes.
+    #   6. Send the full history + new turn to the provider.
+    #   7. Inspect result.ok and result.truncated - never grep result.text.
+    #   8. Route the response to a write-target buffer/file if requested,
+    #      otherwise show it inline in the chat transcript.
     def ChatSend(end_line: number)
         if !exists('b:ai_chat')
             echoerr "AIChatSend: not in an AI Chat buffer. Start one with :AIChat, or reopen a saved one with :AIChatResume."
@@ -90,17 +182,18 @@ export class AIPlugin
         endif
 
         var chat_id = b:ai_chat_id
+        var session = this.config.GetChatSession(chat_id)
+        if empty(session)
+            echoerr $"AIChatSend: no registered session for chat '{chat_id}'. The chat may have been reopened without :AIChatResume."
+            return
+        endif
+
         var raw_prompt = this.buffer.GetNewPromptText(end_line)
         if empty(raw_prompt)
             echo "AIChatSend: no new question found under '## You'."
             return
         endif
 
-        # {=>name=} / {=>*=} route the response to a file/buffer (or, for
-        # {=>*=}, a batch of new buffers) instead of displaying it inline
-        # - see AIPrompt.ExtractWriteTarget. The directive itself is
-        # stripped before the prompt is expanded and sent; the model
-        # never sees it.
         var write_info = this.prompt.ExtractWriteTarget(raw_prompt)
         var expanded_prompt = this.prompt.ExpandReferences(write_info.stripped)
         if this.prompt.had_error
@@ -108,58 +201,83 @@ export class AIPlugin
             return
         endif
 
+        # history_prompt keeps the user-visible text (no injected
+        # instructions); the instructions are appended only to
+        # expanded_prompt, which IS sent to the API. This means the JSON
+        # history doesn't accumulate boilerplate "respond with only the
+        # code" instructions across turns, keeping the context cleaner.
+        var history_prompt = expanded_prompt
+
         if write_info.wildcard
-            expanded_prompt ..= "\n\nRespond with only the resulting code, one fenced code block per file needed, with no other commentary. For any file you're returning a full replacement version of that was tagged earlier in this conversation with a `[ID: name]` round-trip instruction, begin that file's answer with its exact `[ID: name]` marker on its own line, immediately followed by the fenced code block."
+            expanded_prompt ..= "\n\nRespond with only the resulting code, one fenced code block per file needed, with no other commentary."
         elseif !empty(write_info.target)
             expanded_prompt ..= "\n\nRespond with only the resulting code, in a single fenced code block, with no explanation."
         endif
 
         var history = this.buffer.LoadHistory(chat_id)
-        var provider = this.GetCurrentProvider()
-        echo $"Querying {this.config.provider}..."
 
-        # Set inside the try block below, only for a successful wildcard
-        # turn - used after AppendChatTurn to jump the user to the new
-        # output tabs, once it's safe to leave the chat buffer (see
-        # AIBuffer.WriteResponseToWildcard for why that ordering matters).
+        # Resolve provider from the session registry - never from global config.
+        var provider = this.GetChatSessionProvider(chat_id)
+        var provider_name = this.config.GetChatSessionProvider(chat_id)
+        var model = this.config.GetChatSessionModel(chat_id)
+
+        echo $"Querying {provider_name} ({model})..."
+
+        # first_win captures the first review tab opened by
+        # WriteResponseToWildcard (if any) so we can jump there after
+        # finishing all chat-buffer housekeeping.
         var wildcard_first_win = -1
-
-        # Captured right before the request goes out, so the '## AI'
-        # header (written by AppendChatTurn below) records when THIS
-        # prompt was actually sent - not when the response happened to
-        # come back. See AIBuffer.AppendChatTurn/CreateChat for how
-        # this pairs with the '## You' timestamps (session-start /
-        # previous-response-received).
         var sent_at = this.buffer.NowStamp()
 
         try
-            var response = provider.GenerateChat(history + [{role: 'user', text: expanded_prompt}])
-            # The full expanded prompt and full raw response are always
-            # persisted to JSON history, even for write-target turns -
-            # only the visible .md log gets the shortened summary below.
-            this.buffer.AppendHistoryTurn(chat_id, expanded_prompt, response)
+            var result = provider.GenerateChat(
+                history + [{role: 'user', text: expanded_prompt}],
+                chat_id
+            )
 
-            var display = response
-            if write_info.wildcard
-                var blocks = this.prompt.ExtractIdentifiedBlocks(response)
-                var result = this.buffer.WriteResponseToWildcard(blocks, write_info.output_dir)
-                display = result.ok ? $'-> {result.summary}' : $'-> Error: {result.error}'
-                if result.ok
-                    wildcard_first_win = result.first_win
-                endif
-            elseif !empty(write_info.target)
-                var code = this.prompt.ExtractCodeBlock(response)
-                var result = this.buffer.WriteResponseToTarget(write_info.target, code)
-                display = result.ok ? $'-> {result.summary}' : $'-> Error: {result.error}'
+            # Inspect result.ok and result.truncated only - never grep
+            # result.text for signals. Source code, markdown, anything
+            # can appear in result.text without triggering false positives.
+            if !result.ok
+                this.buffer.AppendChatTurn(result.error, model, sent_at)
+                echohl WarningMsg
+                echo "AI API returned an error (not saved to chat history)."
+                echohl None
+                return
             endif
 
-            this.buffer.AppendChatTurn(display, provider.GetCurrentModel(), sent_at)
+            if get(result, 'truncated', false)
+                # Truncated: show partial text in chat but do not write
+                # to filesystem targets and do not save to JSON history,
+                # since partial content is not reliable context.
+                var trunc_msg = $"[Warning: Response was truncated before completion - output not written.]"
+                if write_info.wildcard || !empty(write_info.target)
+                    trunc_msg = $"[Warning: Response was truncated before completion - output not written. Increase max_tokens or reduce file size.]"
+                endif
+                this.buffer.AppendChatTurn(trunc_msg, model, sent_at)
+                echo "AI response truncated."
+                return
+            endif
+
+            this.buffer.AppendHistoryTurn(chat_id, history_prompt, result.text)
+
+            var display = result.text
+            if write_info.wildcard
+                var blocks = this.prompt.ExtractIdentifiedBlocks(result.text)
+                var write_result = this.buffer.WriteResponseToWildcard(blocks, write_info.output_dir)
+                display = write_result.ok ? $'-> {write_result.summary}' : $'-> Error: {write_result.error}'
+                if write_result.ok
+                    wildcard_first_win = write_result.first_win
+                endif
+            elseif !empty(write_info.target)
+                var code = this.prompt.ExtractCodeBlock(result.text)
+                var write_result = this.buffer.WriteResponseToTarget(write_info.target, code)
+                display = write_result.ok ? $'-> {write_result.summary}' : $'-> Error: {write_result.error}'
+            endif
+
+            this.buffer.AppendChatTurn(display, model, sent_at)
             echo "AI response received."
 
-            # Only jump to the new output tabs now that the chat log
-            # buffer has been safely appended to and autosaved above -
-            # doing this any earlier is what caused the chat turn to
-            # land in the wrong buffer (see WriteResponseToWildcard).
             if wildcard_first_win != -1
                 win_gotoid(wildcard_first_win)
             endif
@@ -168,34 +286,24 @@ export class AIPlugin
         endtry
     enddef
 
-    # Clears the persisted JSON history for the current session only -
-    # the visible .md log is untouched, so you can still read or copy
-    # from it. Future turns simply stop resending everything before
-    # this point.
-    # Opens the rendered HTML for a chat session in the OS default
-    # browser (see AIBuffer.OpenHtmlInBrowser/_LaunchInBrowser).
-    # Resolution order:
-    #   1. A session line under the cursor, as listed by
-    #      :AIChatHistory - same lookup ChatResume/ChatDelete use.
-    #   2. Otherwise, if the current buffer IS a chat, that session -
-    #      the "pause mid-chat and look at it" case, so a plain
-    #      :AIChatDisplay run from inside the chat you're looking at
-    #      does what you'd expect.
-    #   3. Otherwise, the most recently modified saved session.
-    # AIChatDisplay is defined with -range in plugin/ai.vim, so a plain
-    # :AIChatDisplay with no selection passes the current line as lnum.
+    # :AIChatDisplay - render the session's .md transcript to HTML and
+    # open it in the OS default browser. Must be called from a chat
+    # buffer or from a history list line with a valid session id.
+    # Deliberately does NOT fall back to any arbitrary loaded buffer or
+    # most-recent session on disk, which could belong to a different
+    # Vim process.
     def ChatDisplay(lnum: number)
         var target = this.buffer.ChatIdFromHistoryLine(getline(lnum))
-        if empty(target) && exists('b:ai_chat_id')
-            target = b:ai_chat_id
+        if empty(target)
+            # Only accept b:ai_chat_id from a registered session buffer.
+            var session = this.config.GetChatSessionForCurrentBuffer()
+            if !empty(session)
+                target = session.chat_id
+            endif
         endif
         if empty(target)
-            var sessions = this.buffer.ListSessions()
-            if empty(sessions)
-                echoerr "AIChatDisplay: no saved AI chats found."
-                return
-            endif
-            target = sessions[0].id
+            echoerr "AIChatDisplay: run this command from a chat buffer or a chat history line."
+            return
         endif
 
         var result = this.buffer.OpenHtmlInBrowser(target)
@@ -212,7 +320,7 @@ export class AIPlugin
             return
         endif
         this.buffer.ClearHistory(b:ai_chat_id)
-        echo "AI Chat history cleared for this session. The visible transcript is unchanged."
+        echo "AI Chat history cleared for this session."
     enddef
 
     def ChatHistory()
@@ -221,63 +329,56 @@ export class AIPlugin
             echo "No saved AI chats found."
             return
         endif
-
         this.buffer.DisplayChatHistory(sessions)
         echo "AI Chat sessions listed."
     enddef
 
-    # Resumes the session named on lnum (a session line as written by
-    # AIBuffer.DisplayChatHistory, e.g. from the :AIChatHistory listing)
-    # if there is one - otherwise falls back to the most recent session.
-    # AIChatResume is defined with -range in plugin/ai.vim, so a plain
-    # :AIChatResume with no selection passes the current line, which is
-    # what makes "put the cursor on a session line and run
-    # :AIChatResume" work without needing to know which buffer you're
-    # in or type an id.
+    # :AIChatResume - if the cursor line carries a valid session id (from
+    # :AIChatHistory), that session is resumed; otherwise the most
+    # recently modified session is used as a fallback. Registers the
+    # resumed session in the ChatSessionInfo registry, snapshotting the
+    # current global provider/model/api_version.
     def ChatResume(lnum: number)
         var target = this.buffer.ChatIdFromHistoryLine(getline(lnum))
-
         var resolved = this.buffer.ResumeChat(target)
         if empty(resolved)
-            var target_desc = empty(target) ? 'any saved chat' : $"a chat matching '{target}'"
-            echoerr $"AIChatResume: could not find {target_desc}. Try :AIChatHistory to list sessions."
+            echoerr "AIChatResume: could not find session."
             return
         endif
-        echo $"Resumed AI Chat '{resolved}'."
+
+        var provider_name = this.config.provider
+        var provider = this.GetCurrentProvider()
+        var model = provider.GetDefaultModel()
+        var api_version = this.config.ApiVersionForProvider(provider_name)
+        var bufnr = bufnr('%')
+
+        this.config.RegisterChatSession(resolved, bufnr, provider_name, model, api_version)
+
+        echo $"Resuming chat '{resolved}' with provider '{provider_name}', model '{model}'."
     enddef
 
-    # Deletes the session named on lnum. Unlike ChatResume, this has no
-    # "most recent" fallback - if the cursor isn't on a valid session
-    # line, it errors out rather than guessing, since deleting the wrong
-    # chat isn't recoverable.
     def ChatDelete(lnum: number)
         var target = this.buffer.ChatIdFromHistoryLine(getline(lnum))
         if empty(target)
-            echoerr "AIChatDelete: the current line isn't a saved chat session. Run this from :AIChatHistory with the cursor on a session line."
+            echoerr "AIChatDelete: current line isn't a saved chat session."
             return
         endif
-
         if !this.buffer.DeleteChat(target)
             echoerr $"AIChatDelete: could not delete chat '{target}'."
             return
         endif
-
         this.buffer.RefreshChatHistory(this.buffer.ListSessions())
         echo $"Deleted AI Chat '{target}'."
     enddef
 
+    # :AIAsk - send visually selected text (or a range) as a raw prompt,
+    # after expanding any {=...=} references it contains.
     def Ask(lines: list<string>)
         if empty(lines)
             echo "AIAsk: Please make a visual selection or provide a range."
             return
         endif
-
         var user_prompt = join(lines, "\n")
-        if empty(user_prompt)
-            echo "AIAsk: Selection is empty."
-            return
-        endif
-
         var expanded_prompt = this.prompt.ExpandReferences(user_prompt)
         if this.prompt.had_error
             echoerr $"AIAsk: {this.prompt.last_error}"
@@ -286,34 +387,27 @@ export class AIPlugin
         this.Query('AIAsk', expanded_prompt)
     enddef
 
+    # :AIExplain - wrap the selection in a canned "explain this code"
+    # prompt. Refuses to run in nofile buffers (the plugin's own output
+    # windows) since they have no meaningful filetype/filename context.
     def Explain(lines: list<string>)
         if &buftype == 'nofile'
             echoerr "AIExplain cannot be run in this buffer."
             return
         endif
-
         var selection = join(lines, "\n")
-        if empty(selection)
-            echo "AIExplain: Please make a visual selection or provide a range."
-            return
-        endif
-
         var user_prompt = this.prompt.BuildExplainPrompt(selection, &filetype, expand('%:t'))
         this.Query('AIExplain', user_prompt)
     enddef
 
+    # :AIReview - same guard as Explain; wraps selection in a canned
+    # "review this code strictly on what's provided" prompt.
     def Review(lines: list<string>)
         if &buftype == 'nofile'
             echoerr "AIReview cannot be run in this buffer."
             return
         endif
-
         var selection = join(lines, "\n")
-        if empty(selection)
-            echo "AIReview: Please make a visual selection or provide a range."
-            return
-        endif
-
         var user_prompt = this.prompt.BuildReviewPrompt(selection, &filetype, expand('%:t'))
         this.Query('AIReview', user_prompt)
     enddef
@@ -323,15 +417,8 @@ export class AIPlugin
             echoerr "AIReviewFile cannot be run in this buffer."
             return
         endif
-
         var file_content = getline(1, '$')
         var file_text = join(file_content, "\n")
-
-        if empty(file_text)
-            echo "AIReviewFile: The file is empty."
-            return
-        endif
-
         var user_prompt = this.prompt.BuildReviewPrompt(file_text, &filetype, expand('%:t'))
         this.Query('AIReviewFile', user_prompt)
     enddef
@@ -352,21 +439,55 @@ export class AIPlugin
         endtry
     enddef
 
-    def SetDebug(arg: string)
-        if arg == 'on'
-            this.config.debug = true
-        elseif arg == 'off'
-            this.config.debug = false
-        elseif empty(arg)
-            this.config.debug = !this.config.debug
-        else
-            echoerr "AIDebug: expected 'on', 'off', or no argument to toggle."
+    # :DBGShowLog - display the debug message log for the current Vim
+    # session in a named scratch buffer ('message_log.txt'). The log is
+    # written by Util.DBG() to a per-session file under the vimgem log
+    # directory (named debug_<pid>.log). The file is initialized at
+    # startup by util.vim even when all debug levels are off, so it
+    # should always exist. If it is somehow missing, a soft echo message
+    # is shown rather than an error.
+    def ShowLog()
+        var logpath = Util.GetMessageLogPath()
+        if !filereadable(logpath)
+            echo $"DBGShowLog: log file not found: {logpath}"
             return
         endif
-        g:debug = this.config.debug ? 1 : 0
-        echo $"AI debug mode: {this.config.debug ? 'On' : 'Off'} (curl commands will be echoed via :messages, API keys redacted)"
+        var lines = readfile(logpath)
+        this.buffer.DisplayText(lines, 'text', 'message_log.txt')
     enddef
 
+    # :DBGShowJson - display a human-readable rendering of the JSON chat
+    # history for the current chat session. Must be called from a
+    # registered chat buffer. Deliberately does NOT fall back to any
+    # arbitrary loaded buffer or most-recent session on disk.
+    # Requires jq to be installed.
+    def ShowJsonHistory()
+        if !executable('jq')
+            echo "DBGShowJson: 'jq' is not installed or not on PATH. Install jq to use this command."
+            return
+        endif
+
+        # Only accept a session that is registered in the ChatSessionInfo
+        # registry - not just any buffer with b:ai_chat_id set.
+        var session = this.config.GetChatSessionForCurrentBuffer()
+        if empty(session)
+            echoerr "DBGShowJson: run this command from an active chat buffer (opened via :AIChat or :AIChatResume)."
+            return
+        endif
+
+        var chat_id = session.chat_id
+        var lines = this.buffer.ShowJsonHistory(chat_id)
+        if empty(lines)
+            echo $"DBGShowJson: no history found for chat '{chat_id}'."
+            return
+        endif
+
+        this.buffer.DisplayText(lines, 'text', 'json_readable.txt')
+        echo $"DBGShowJson: showing JSON history for chat '{chat_id}'."
+    enddef
+
+    # :AIPrompt [on|off] - toggle or explicitly set whether query
+    # responses include the original prompt and a provider/model header.
     def SetShowPrompt(arg: string)
         if arg == 'on'
             this.config.show_prompt = true
@@ -382,17 +503,9 @@ export class AIPlugin
         echo $"Show prompt: {this.config.show_prompt ? 'On' : 'Off'}"
     enddef
 
-    # Deliberately NOT the same toggle-on-no-arg pattern as
-    # SetShowPrompt/SetDebug above. Those are safe to toggle blind -
-    # you already know your own show_prompt/debug state, so running
-    # the command with no args is a deliberate flip. This flag is
-    # different: it's the one guard standing between a {=>*=}/{=>name=}
-    # response and files getting overwritten on disk (see
-    # AIBuffer.WriteResponseToWildcard/WriteResponseToTarget), so
-    # running :AIReviewReceived to check its current value should never
-    # itself be the action that silently turns review mode off. No
-    # argument reports the current value only; only an explicit 'on' or
-    # 'off' changes it.
+    # :AIReviewReceived [on|off] - unlike :AIPrompt, no-argument reports
+    # rather than toggles, because this flag gates file writes and
+    # silently toggling it off could cause unexpected disk modifications.
     def SetReviewReceived(arg: string)
         if arg == 'on'
             this.config.always_review_received_files = true
@@ -402,36 +515,37 @@ export class AIPlugin
             echo $"Always review received files: {this.config.always_review_received_files ? 'On' : 'Off'}"
             return
         else
-            echoerr "AIReviewReceived: expected 'on' or 'off' to change it, or no argument to report the current value."
+            echoerr "AIReviewReceived: expected 'on' or 'off'."
             return
         endif
         g:always_review_received_files = this.config.always_review_received_files ? 1 : 0
         echo $"Always review received files: {this.config.always_review_received_files ? 'On' : 'Off'}"
     enddef
 
+    # :AIUrl [url] - get or set the openai provider's base URL at runtime.
+    # Only applies to the openai provider; errors if another is active so
+    # accidental use with gemini/claude doesn't silently set a field that
+    # has no effect on the current provider.
     def SetBaseUrl(arg: string)
         if this.config.provider != 'openai'
-            echoerr $"AIUrl only applies to the openai provider (current provider is '{this.config.provider}')."
+            echoerr $"AIUrl only applies to the openai provider."
             return
         endif
-
         if empty(arg)
             echo "Current openai_base_url: " .. this.config.openai_base_url
             return
         endif
-
         this.config.openai_base_url = arg
         g:openai_base_url = arg
         echo "OpenAI base URL set to: " .. arg
     enddef
 
-    # Generic get/set for any key in Cfg.AIConfig.CONFIGURABLE_KEYS -
-    # the "expert" escape hatch that reaches every configurable setting
-    # without needing a dedicated command per field. No args: list valid
-    # keys. Key only: show its current value. Both: set it. Unlike
-    # :AIModel, this does NOT check the value against the current
-    # provider - if you're using :AISet you're assumed to know what
-    # you're doing (e.g. pre-configuring a provider before switching to it).
+    # :AISet [key] [value] - generic get/set for any AIConfig field.
+    # No args  -> list all valid keys.
+    # key only -> show current value of that key.
+    # key+val  -> set it globally (mirror to g:), and if called from a
+    #             chat buffer, also update the session snapshot for
+    #             model/api_version fields that have per-chat meaning.
     def SetConfig(key: string = '', value: string = '')
         if empty(key)
             echo join(Cfg.AIConfig.CONFIGURABLE_KEYS, "\n")
@@ -441,11 +555,27 @@ export class AIPlugin
             echo $'{key} = {this.config.Get(key)}'
             return
         endif
-        if this.config.Set(key, value)
-            echo $'{key} set to: {value}'
+        if !this.config.Set(key, value)
+            return
+        endif
+        echo $'{key} set to: {value}'
+
+        # If called from a chat buffer, mirror model/api_version changes
+        # into the session snapshot so the current chat is also affected.
+        var session = this.config.GetChatSessionForCurrentBuffer()
+        if empty(session)
+            return
+        endif
+        var chat_id = session.chat_id
+        if key == 'gemini_model' || key == 'claude_model' || key == 'openai_model'
+            this.config.UpdateChatSessionModel(chat_id, value)
+        elseif key == 'gemini_api_version' || key == 'claude_api_version'
+            this.config.UpdateChatSessionApiVersion(chat_id, value)
         endif
     enddef
 
+    # :AIInfo - assemble and display the full status page: config header,
+    # active provider's current settings, all commands, and .vimrc examples.
     def ShowInfo()
         var provider = this.GetCurrentProvider()
         var lines = this.config.GetHeaderLines()
@@ -473,43 +603,34 @@ export class AIPlugin
         echo "Plugin info displayed."
     enddef
 
-    # With an explicit model name, sets it directly (unchanged). With no
-    # name, tries to read one off lnum first - a model line from a
-    # :AIModels listing, per AIBuffer.ModelNameFromModelsLine - so a bare
-    # :AIModel run with the cursor on such a line switches to it. If
-    # lnum isn't a model line (e.g. :AIModel run somewhere else
-    # entirely), falls back to the original no-arg behavior: just show
-    # the current model. AIModel is defined with -range in
-    # plugin/ai.vim, so a plain :AIModel with no selection passes the
-    # current line as lnum.
+    # :AIModel [name] - set the active provider's default model globally.
+    # With no name: if the cursor is on a model line from :AIModels,
+    # switch to that model; otherwise just report the current default.
+    # With a name: set it directly, regardless of cursor position.
+    # If called from a chat buffer, also updates that chat's session
+    # snapshot so the change takes effect immediately for the current chat.
     def SetModel(model: string, lnum: number)
         var provider = this.GetCurrentProvider()
         var target = model
-
         if empty(target)
             target = this.buffer.ModelNameFromModelsLine(getline(lnum))
         endif
-
         if empty(target)
-            echo "Current model: " .. provider.GetCurrentModel()
+            echo "Current default model: " .. provider.GetDefaultModel()
             return
         endif
 
-        this.WarnIfModelMismatched(target)
+        # Update the global config default for the current provider.
+        var model_key = this.config.provider .. '_model'
+        this.config.Set(model_key, target)
 
-        provider.SetModel(target)
-        echo "Model set to: " .. target
-    enddef
-
-    # Soft sanity check: ask every OTHER provider whether this model name
-    # looks like it's theirs (via IsRecognizedModel). Warns but doesn't
-    # block, since custom/local model names can't always be predicted.
-    # New providers get this check for free - no hardcoded names here.
-    def WarnIfModelMismatched(model: string)
-        for [name, provider] in items(this.providers)
-            if name != this.config.provider && provider.IsRecognizedModel(model)
-                echoerr $"Warning: '{model}' looks like a {name} model, but the current provider is '{this.config.provider}'."
-            endif
-        endfor
+        # If called from a chat buffer, also update that chat's snapshot.
+        var session = this.config.GetChatSessionForCurrentBuffer()
+        if !empty(session)
+            this.config.UpdateChatSessionModel(session.chat_id, target)
+            echo $"Model set to '{target}' (global default and current chat)."
+        else
+            echo $"Model set to '{target}' (global default for new chats)."
+        endif
     enddef
 endclass

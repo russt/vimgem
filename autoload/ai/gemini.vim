@@ -8,6 +8,19 @@ vim9script
 # file plus config.vim (for the AIConfig type), provider.vim (for the
 # interface it implements) and util.vim (for RedactSecret). None of the
 # Claude/OpenAI provider code is needed.
+#
+# Per-chat model and api_version are read from the ChatSessionInfo
+# registry via this.config.GetChatSessionModel(chat_id) and
+# this.config.GetChatSessionApiVersion(chat_id). When chat_id is ''
+# (one-shot commands: :AIQuery, :AIExplain, :AIReview, :AIReviewFile),
+# the provider falls back to the global config fields
+# this.config.gemini_model and this.config.gemini_api_version.
+#
+# This provider never writes to this.config. Model and provider
+# selection are config/session concerns managed by AIPlugin (core.vim).
+#
+# GenerateContent and GenerateChat return dict<any> - see provider.vim
+# for the return value convention.
 
 import './config.vim' as Cfg
 import './provider.vim' as Provider
@@ -26,25 +39,15 @@ export class GeminiProvider extends Provider.AIProvider
         return "Error: GOOGLE_API_KEY environment variable not set."
     enddef
 
-    def GetCurrentModel(): string
+    # Returns the global default model for display purposes (:AIInfo,
+    # :AIModels, confirmation messages). Not the per-chat model.
+    def GetDefaultModel(): string
         return this.config.gemini_model
-    enddef
-
-    def SetModel(model: string)
-        this.config.gemini_model = model
-        g:gemini_model = model
-    enddef
-
-    def RefreshDefaults()
-        if empty(this.config.gemini_model)
-            this.config.gemini_model = get(g:, 'gemini_model', Cfg.PROVIDER_MODEL_DEFAULTS.gemini)
-        endif
-        this.config.gemini_api_key = $GOOGLE_API_KEY
     enddef
 
     def GetStatusLines(): list<string>
         return [
-            $'  Model: {this.config.gemini_model}',
+            $'  Model (default): {this.config.gemini_model}',
             $'  API Version: {this.config.gemini_api_version}',
             $'  API Key: {!empty(this.config.gemini_api_key) ? "Set" : "NOT SET"}',
         ]
@@ -62,8 +65,27 @@ export class GeminiProvider extends Provider.AIProvider
         return model =~ '^gemini-'
     enddef
 
-    def BuildURL(endpoint: string): string
-        return $'https://generativelanguage.googleapis.com/{this.config.gemini_api_version}/{endpoint}?key={this.config.gemini_api_key}'
+    # Resolve model and api_version for this call. When chat_id is
+    # non-empty, read from the per-chat session snapshot; otherwise fall
+    # back to global config. This is the only place in this provider that
+    # decides which model/version to use.
+    def ResolveModelAndVersion(chat_id: string): dict<string>
+        if !empty(chat_id)
+            var m = this.config.GetChatSessionModel(chat_id)
+            var v = this.config.GetChatSessionApiVersion(chat_id)
+            return {
+                model:       !empty(m) ? m : this.config.gemini_model,
+                api_version: !empty(v) ? v : this.config.gemini_api_version,
+            }
+        endif
+        return {
+            model:       this.config.gemini_model,
+            api_version: this.config.gemini_api_version,
+        }
+    enddef
+
+    def BuildURL(endpoint: string, api_version: string): string
+        return $'https://generativelanguage.googleapis.com/{api_version}/{endpoint}?key={this.config.gemini_api_key}'
     enddef
 
     def ExecuteCurl(url: string, method: string = 'GET', payload: string = ''): dict<any>
@@ -76,9 +98,7 @@ export class GeminiProvider extends Provider.AIProvider
             curl_cmd = 'curl -s -X GET ' .. shellescape(url)
         endif
 
-        if this.config.debug
-            echom '[AI debug] ' .. Util.RedactSecret(curl_cmd, this.config.gemini_api_key)
-        endif
+        g:DBG(this.config.curl_trace_level, '[AI debug] %s', Util.RedactSecret(curl_cmd, this.config.gemini_api_key))
 
         var response = system(curl_cmd)
         var exit_code = v:shell_error
@@ -99,7 +119,8 @@ export class GeminiProvider extends Provider.AIProvider
             return this.GetAPIKeyError()
         endif
 
-        var url = this.BuildURL('models')
+        # ListModels is not chat-specific; use the global api_version.
+        var url = this.BuildURL('models', this.config.gemini_api_version)
         var result = this.ExecuteCurl(url)
 
         if has_key(result, 'error')
@@ -140,12 +161,13 @@ export class GeminiProvider extends Provider.AIProvider
         return output
     enddef
 
-    def GenerateContent(prompt: string): string
+    def GenerateContent(prompt: string, chat_id: string): dict<any>
         if !this.IsValid()
-            return this.GetAPIKeyError()
+            return {ok: false, error: this.GetAPIKeyError()}
         endif
 
-        var url = this.BuildURL($'models/{this.config.gemini_model}:generateContent')
+        var resolved = this.ResolveModelAndVersion(chat_id)
+        var url = this.BuildURL($'models/{resolved.model}:generateContent', resolved.api_version)
         var payload = json_encode({
             contents: [{
                 parts: [{text: prompt}]
@@ -156,10 +178,12 @@ export class GeminiProvider extends Provider.AIProvider
         return this.ExtractResult(result)
     enddef
 
-    def GenerateChat(messages: list<dict<string>>): string
+    def GenerateChat(messages: list<dict<string>>, chat_id: string): dict<any>
         if !this.IsValid()
-            return this.GetAPIKeyError()
+            return {ok: false, error: this.GetAPIKeyError()}
         endif
+
+        var resolved = this.ResolveModelAndVersion(chat_id)
 
         # Gemini calls the model's own turns 'model', not 'assistant'.
         var contents = []
@@ -170,24 +194,26 @@ export class GeminiProvider extends Provider.AIProvider
             })
         endfor
 
-        var url = this.BuildURL($'models/{this.config.gemini_model}:generateContent')
+        var url = this.BuildURL($'models/{resolved.model}:generateContent', resolved.api_version)
         var payload = json_encode({contents: contents})
 
         var result = this.ExecuteCurl(url, 'POST', payload)
         return this.ExtractResult(result)
     enddef
 
-    # Shared response handling for GenerateContent and GenerateChat -
-    # both hit the same endpoint shape, only the request payload differs.
-    def ExtractResult(result: dict<any>): string
+    # Shared response handling for GenerateContent and GenerateChat.
+    # Returns dict<any> - see provider.vim for the return value convention.
+    # Gemini does not expose a stop_reason equivalent in the same way
+    # Claude does; truncation is indicated by finishReason == 'MAX_TOKENS'.
+    def ExtractResult(result: dict<any>): dict<any>
         if has_key(result, 'error')
-            return $"Error: {result.error}"
+            return {ok: false, error: $"Error: {result.error}"}
         endif
 
         var json_response = result.data
 
         if has_key(json_response, 'error')
-            return $"API Error: {json_response.error.message}"
+            return {ok: false, error: $"API Error: {json_response.error.message}"}
         endif
 
         if has_key(json_response, 'candidates') && !empty(json_response.candidates)
@@ -195,11 +221,16 @@ export class GeminiProvider extends Provider.AIProvider
             if has_key(candidate, 'content') && has_key(candidate.content, 'parts')
                 var parts = candidate.content.parts
                 if !empty(parts) && has_key(parts[0], 'text')
-                    return parts[0].text
+                    var text = parts[0].text
+                    var finish_reason = get(candidate, 'finishReason', '')
+                    if finish_reason == 'MAX_TOKENS'
+                        return {ok: true, text: text, truncated: true}
+                    endif
+                    return {ok: true, text: text}
                 endif
             endif
         endif
 
-        return "Error: Received an empty or malformed response from the API."
+        return {ok: false, error: "Error: Received an empty or malformed response from the API."}
     enddef
 endclass

@@ -10,6 +10,7 @@ vim9script
 
 import './config.vim' as Cfg
 import './md.vim' as Md
+import './md_syntax.vim' as Syntax
 import './util.vim' as Util
 
 # Marker delimiting the start of a new question in an :AIChat buffer.
@@ -40,6 +41,17 @@ const HISTORY_LINE_PATTERN = '^- \(\S\+\)\s\+('
 # ' - description' and leaves just the model id.
 const MODELS_LINE_PATTERN = '^  \(\S\+\)'
 
+# Name of the debug message log buffer, shared between RefreshMessageLog
+# (which updates it) and DisplayText (which creates it via ShowLog).
+# Kept as a constant so the two can't drift out of sync.
+const MESSAGE_LOG_BUFNAME = 'message_log.txt'
+
+# Name of the JSON-readable display buffer, shared between
+# ShowJsonHistory (which creates it via DisplayText) and
+# RefreshJsonHistory (which updates it in place after each turn).
+# Kept as a constant so the two can't drift out of sync.
+const JSON_READABLE_BUFNAME = 'json_readable.txt'
+
 export class AIBuffer
     var config: Cfg.AIConfig
 
@@ -50,7 +62,35 @@ export class AIBuffer
     def Create(filetype: string = 'markdown')
         new
         setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
-        execute 'setlocal filetype=' .. filetype
+        if filetype ==# 'markdown'
+            # 'aimd', not Vim's bundled 'markdown' - real highlighting
+            # is applied per-buffer by ApplyMarkdownHighlighting once
+            # content actually exists, since it depends on that content
+            # (e.g. which languages appear in fenced code blocks).
+            setlocal filetype=aimd
+        else
+            execute 'setlocal filetype=' .. filetype
+        endif
+    enddef
+
+    # Re-derives and applies Markdown-ish syntax highlighting for the
+    # CURRENT buffer's actual content, via md_syntax.vim's
+    # MdSyntaxEmitter - see that class for why this replaces Vim's
+    # bundled 'markdown' syntax (mainly: real per-language highlighting
+    # inside fenced code blocks, driven by its own fence detection).
+    # Safe to call repeatedly on the same buffer - e.g. AppendChatTurn
+    # calls this again after adding a new turn - since Render() always
+    # starts with a `syntax clear`.
+    def ApplyMarkdownHighlighting()
+        for cmd in Syntax.MdSyntaxEmitter.Render(getline(1, '$'))
+            execute cmd
+        endfor
+        # Not part of Render()'s command list: `:let`/bare-assignment
+        # Ex-command strings can't be execute()'d from a vim9script
+        # (E1126 Cannot use :let in Vim9 script) - only real assignment
+        # statements like this one can set a buffer-local variable
+        # here.
+        b:current_syntax = 'aimd'
     enddef
 
     def SetContent(lines: list<string>)
@@ -102,11 +142,247 @@ export class AIBuffer
         else
             this.SetContent(split(response, '\n'))
         endif
+        this.ApplyMarkdownHighlighting()
     enddef
 
-    def DisplayText(lines: list<string>, filetype: string = 'text')
+    # Display lines in a throwaway scratch buffer. filetype defaults to
+    # 'text'. bufname, when given, is applied via :file so the buffer
+    # appears under that name in :ls and the status line - useful for
+    # named log/diagnostic displays like :DBGShowLog ('message_log.txt')
+    # and :DBGShowJson ('json_readable.txt').
+    # Pure temporary displays (ShowModels, ShowInfo, DBGShowAST, etc.)
+    # omit bufname and get an anonymous scratch buffer as before.
+    #
+    # Uses ReplaceContent rather than SetContent so that if a same-named
+    # buffer is already open (e.g. a previous :DBGShowJson left
+    # json_readable.txt loaded), the new content fully replaces the old
+    # rather than leaving stale lines from a longer previous render
+    # visible past the end of the new one.
+    def DisplayText(lines: list<string>, filetype: string = 'text', bufname: string = '')
+        # If a buffer with this name is already open and visible in a
+        # window, jump to that window and replace its content in place
+        # rather than opening a new split.
+        if !empty(bufname)
+            var existing = bufnr(bufname)
+            if existing != -1 && bufloaded(existing)
+                var wins = win_findbuf(existing)
+                if !empty(wins)
+                    win_gotoid(wins[0])
+                else
+                    execute 'sbuffer ' .. existing
+                endif
+                this.ReplaceContent(lines)
+                normal! G
+                return
+            endif
+        endif
+
         this.Create(filetype)
-        this.SetContent(lines)
+        if !empty(bufname)
+            execute 'file ' .. fnameescape(bufname)
+        endif
+        # ReplaceContent instead of SetContent: trims any surplus lines
+        # if the new content is shorter than whatever was here before.
+        this.ReplaceContent(lines)
+        if filetype ==# 'markdown'
+            this.ApplyMarkdownHighlighting()
+        endif
+        normal! G
+    enddef
+
+    # Refreshes the message_log.txt buffer in place if it is currently
+    # loaded, by rereading logfn from disk and replacing the buffer
+    # contents with setbufline()/deletebufline(). Also scrolls any
+    # window displaying that buffer to the last line, matching tail -f
+    # behaviour. Called by DBG() (via util_facade) immediately after
+    # each writefile() so the buffer stays live without any polling.
+    # No-op if message_log.txt is not open, so the overhead on every
+    # DBG() call when the log buffer is closed is just two cheap Vim
+    # function calls (bufnr + bufloaded).
+    def RefreshMessageLog(logfn: string)
+        var lbuf = bufnr(MESSAGE_LOG_BUFNAME)
+        if lbuf == -1 || !bufloaded(lbuf)
+            return
+        endif
+
+        var lines = readfile(logfn)
+
+        # Replace buffer contents without switching to it. setbufline()
+        # overwrites existing lines; deletebufline() trims any surplus
+        # lines left over if the new content is shorter than the old
+        # (shouldn't happen for an append-only log, but be safe).
+        setbufline(lbuf, 1, lines)
+        var old_count = line('$', lbuf)
+        if old_count > len(lines)
+            deletebufline(lbuf, len(lines) + 1, old_count)
+        endif
+
+        # Scroll every window that is showing this buffer to the bottom.
+        # win_execute runs the normal! G in the context of that window
+        # without actually switching to it, so the user's current cursor
+        # position and window focus are undisturbed.
+        for wid in win_findbuf(lbuf)
+            win_execute(wid, 'normal! G')
+        endfor
+    enddef
+
+    # ------------------------------------------------------------------
+    # JSON-readable display support (:DBGShowJson)
+    #
+    # Renders the chat JSON history into a human-readable named buffer
+    # ('json_readable.txt'). The full history is shown on first open;
+    # after each AppendHistoryTurn only the new user+assistant pair is
+    # appended to the already-open buffer (no full re-parse needed).
+    #
+    # Pretty-printing is done by Util.PrettyJson (jq -M . + post-
+    # processing to expand embedded newlines to real display lines
+    # aligned at the value column). Each turn pair is enclosed in its
+    # own [ ] array brackets, making them easy to navigate with %.
+    #
+    # Blank-line strategy:
+    #   RenderJsonHistory does NOT add inter-pair blanks - it renders
+    #   each pair standalone. ShowJsonHistory (full render) adds one
+    #   blank line between pairs itself. RefreshJsonHistory (incremental
+    #   append) adds exactly one blank line before the new pair by
+    #   trimming any trailing blank lines already in the buffer first,
+    #   then prepending a single blank. This prevents the double-blank
+    #   that would arise from both sides contributing a blank line.
+    # ------------------------------------------------------------------
+
+    # Render a list of history entries ({role, text} dicts) into display
+    # lines for a SINGLE pair (user + assistant). Does not add any
+    # leading or trailing blank lines - spacing between pairs is the
+    # caller's responsibility (see ShowJsonHistory and
+    # RefreshJsonHistory). Falls back to raw compact JSON if PrettyJson
+    # fails.
+    def RenderJsonHistory(entries: list<dict<string>>): list<string>
+        if empty(entries)
+            return ['(no history yet)']
+        endif
+
+        var result: list<string> = []
+        var i = 0
+        while i < len(entries)
+            # Gather one pair (user + assistant) or a lone trailing entry.
+            var pair: list<dict<string>> = []
+            add(pair, entries[i])
+            if i + 1 < len(entries)
+                add(pair, entries[i + 1])
+                i += 2
+            else
+                i += 1
+            endif
+
+            # Encode this pair as a JSON array and pretty-print it.
+            var raw = json_encode(pair)
+            var pretty = Util.PrettyJson([raw])
+            if empty(pretty)
+                # PrettyJson failed (jq error or not available); fall
+                # back to raw compact encoding so the caller still gets
+                # something rather than nothing.
+                result += [raw]
+            else
+                result += pretty
+            endif
+        endwhile
+
+        return result
+    enddef
+
+    # Full render: build display lines for the entire history of
+    # chat_id. Pairs are separated by exactly one blank line, added
+    # here rather than in RenderJsonHistory so the spacing logic lives
+    # in one place. Returns [] on read failure so the caller can report
+    # the error.
+    def ShowJsonHistory(chat_id: string): list<string>
+        var history = this.LoadHistory(chat_id)
+        var result = [$'# JSON history: {chat_id}', '']
+
+        # Step through history two entries at a time (user+assistant
+        # pairs), rendering each pair and separating with one blank line.
+        var i = 0
+        while i < len(history)
+            var pair: list<dict<string>> = []
+            add(pair, history[i])
+            if i + 1 < len(history)
+                add(pair, history[i + 1])
+                i += 2
+            else
+                i += 1
+            endif
+
+            # One blank line between pairs; no leading blank before
+            # the first pair (the header provides spacing above).
+            if len(result) > 2
+                add(result, '')
+            endif
+            result += this.RenderJsonHistory(pair)
+        endwhile
+
+        if empty(history)
+            add(result, '(no history yet)')
+        endif
+
+        return result
+    enddef
+
+    # Incremental update: appends the last user+assistant pair from the
+    # history of chat_id to the already-open json_readable.txt buffer.
+    # No-op if that buffer is not currently loaded (same pattern as
+    # RefreshMessageLog - zero overhead when the buffer is closed).
+    # Called at the end of AppendHistoryTurn so the display stays live
+    # after every chat turn without requiring a manual :DBGShowJson rerun.
+    #
+    # Blank-line strategy: trim any trailing blank lines from the buffer
+    # first, then prepend exactly one blank before the new pair. This
+    # guarantees exactly one blank between pairs regardless of what the
+    # previous content ended with, without double-blanking.
+    #
+    # Uses getbufinfo() to get the line count of the target buffer
+    # rather than line('$', jbuf) - the latter only works reliably when
+    # jbuf is the current buffer, whereas getbufinfo() works for any
+    # loaded buffer regardless of which window is active.
+    def RefreshJsonHistory(chat_id: string)
+        var jbuf = bufnr(JSON_READABLE_BUFNAME)
+        if jbuf == -1 || !bufloaded(jbuf)
+            return
+        endif
+
+        # Load the full history and take the last two entries (the pair
+        # just written by AppendHistoryTurn). If history has fewer than
+        # two entries we render whatever is there.
+        var history = this.LoadHistory(chat_id)
+        if empty(history)
+            return
+        endif
+
+        var last_pair: list<dict<string>> = []
+        if len(history) >= 2
+            last_pair = [history[-2], history[-1]]
+        else
+            last_pair = [history[-1]]
+        endif
+
+        var new_lines = this.RenderJsonHistory(last_pair)
+
+        # Trim trailing blank lines from the buffer so we can
+        # guarantee exactly one blank separator before the new pair,
+        # without risk of double-blanking from the previous content.
+        var info = getbufinfo(jbuf)
+        var last_line = info[0].linecount
+        while last_line > 1 && getbufline(jbuf, last_line)[0] == ''
+            deletebufline(jbuf, last_line)
+            last_line -= 1
+        endwhile
+
+        # Prepend exactly one blank line as separator, then the pair.
+        appendbufline(jbuf, last_line, [''] + new_lines)
+
+        # Scroll every window showing this buffer to the bottom so the
+        # new turn is immediately visible.
+        for wid in win_findbuf(jbuf)
+            win_execute(wid, 'normal! G')
+        endfor
     enddef
 
     # ------------------------------------------------------------------
@@ -173,6 +449,9 @@ export class AIBuffer
 
         execute 'new ' .. fnameescape(this.LogPath(chat_id))
         setlocal bufhidden=hide
+        # Overrides whatever *.md ftdetect just set (normally
+        # 'markdown') - see Create()/ApplyMarkdownHighlighting for why.
+        setlocal filetype=aimd
         b:ai_chat = 1
         b:ai_chat_id = chat_id
 
@@ -185,6 +464,7 @@ export class AIBuffer
             $'## You  [{this.NowStamp()}]',
             '',
         ])
+        this.ApplyMarkdownHighlighting()
         normal! G
         this.MaybeAutosave()
         return chat_id
@@ -211,6 +491,7 @@ export class AIBuffer
     def AppendChatTurn(display_text: string, model: string, sent_at: string)
         var received_at = this.NowStamp()
         this.AppendContent(['', $'## AI  [{sent_at}] ({model})', ''] + split(display_text, '\n') + ['', $'## You  [{received_at}]', ''])
+        this.ApplyMarkdownHighlighting()
         normal! G
         this.MaybeAutosave()
     enddef
@@ -256,7 +537,7 @@ export class AIBuffer
             var html = Md.MdVim.new().ParseMarkdown(getline(1, '$'))
             writefile(html, this.HtmlPath(b:ai_chat_id))
         catch
-            Util.DBG('MaybeRenderHtml: failed for chat %s: %s', b:ai_chat_id, v:exception)
+            Util.DBG(1, 'MaybeRenderHtml: failed for chat %s: %s', b:ai_chat_id, v:exception)
         endtry
     enddef
 
@@ -396,6 +677,10 @@ export class AIBuffer
         add(history, {role: 'user', text: user_text})
         add(history, {role: 'assistant', text: assistant_text})
         this.SaveHistory(chat_id, history)
+        # Refresh the json_readable.txt buffer in place if it is open,
+        # so :DBGShowJson stays live after every turn without re-running
+        # the command manually. No-op when the buffer is closed.
+        this.RefreshJsonHistory(chat_id)
     enddef
 
     # Erases persisted context for this session so future turns stop
@@ -432,6 +717,7 @@ export class AIBuffer
     def DisplayChatHistory(sessions: list<dict<any>>)
         this.Create('markdown')
         this.SetContent(this.BuildChatHistoryLines(sessions))
+        this.ApplyMarkdownHighlighting()
     enddef
 
     # Re-renders an already-open chat-history listing buffer in place
@@ -442,9 +728,11 @@ export class AIBuffer
     def RefreshChatHistory(sessions: list<dict<any>>)
         if empty(sessions)
             this.ReplaceContent(['# AI Chat Sessions', '', 'No saved AI chats found.'])
+            this.ApplyMarkdownHighlighting()
             return
         endif
         this.ReplaceContent(this.BuildChatHistoryLines(sessions))
+        this.ApplyMarkdownHighlighting()
     enddef
 
     # Recovers a session id from one line of a chat-history listing
@@ -462,6 +750,24 @@ export class AIBuffer
     def ModelNameFromModelsLine(line_text: string): string
         var matches = matchlist(line_text, MODELS_LINE_PATTERN)
         return empty(matches) ? '' : matches[1]
+    enddef
+
+    # Scans all loaded buffers in this Vim instance for one that has
+    # b:ai_chat_id set. Returns the first chat_id found, or '' if no
+    # chat buffer is loaded anywhere. Used by ShowJsonHistory (and
+    # similar commands) to locate the current session when called from
+    # a window whose current buffer is not itself a chat buffer (e.g.
+    # a new split opened for a wider view). Does NOT fall back to disk
+    # - a chat_id found only on disk could belong to a different Vim
+    # process and would be wrong to claim as "current".
+    def FindLoadedChatId(): string
+        for info in getbufinfo({'buflisted': 0})
+            var cid = getbufvar(info.bufnr, 'ai_chat_id', '')
+            if !empty(cid)
+                return cid
+            endif
+        endfor
+        return ''
     enddef
 
     def ListSessions(): list<dict<any>>
@@ -512,6 +818,10 @@ export class AIBuffer
         b:ai_chat = 1
         b:ai_chat_id = substitute(fnamemodify(bufname('%'), ':t:r'), '^chat-', '', '')
         setlocal bufhidden=hide
+        # Overrides whatever *.md ftdetect just set (normally
+        # 'markdown') - see Create()/ApplyMarkdownHighlighting for why.
+        setlocal filetype=aimd
+        this.ApplyMarkdownHighlighting()
     enddef
 
     # Opens the log for chat_id (most recently modified session if
@@ -540,6 +850,10 @@ export class AIBuffer
 
         execute 'edit ' .. fnameescape(md_path)
         setlocal bufhidden=hide
+        # Overrides whatever *.md ftdetect just set (normally
+        # 'markdown') - see Create()/ApplyMarkdownHighlighting for why.
+        setlocal filetype=aimd
+        this.ApplyMarkdownHighlighting()
         b:ai_chat = 1
         b:ai_chat_id = target
         normal! G

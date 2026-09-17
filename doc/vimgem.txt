@@ -1,7 +1,7 @@
 *vimgem.txt* *vimgem*    Multi-provider AI assistant for Vim
 
 
-                VIMGEM REFERENCE MANUAL 0.1.260817
+                VIMGEM REFERENCE MANUAL 0.1.260825
                         by Russ Tremain
 
         Query, chat with, or have code reviewed by an AI model
@@ -23,7 +23,8 @@ CONTENTS                                                       *vimgem-contents*
     6. Chat sessions in depth............................ |ai-chat|
     7. Configuration .................................... |ai-configuration|
     8. Providers ........................................ |ai-providers|
-    9. Troubleshooting .................................. |ai-troubleshooting|
+    9. Debugging ........................................ |ai-debugging|
+   10. Troubleshooting .................................. |ai-troubleshooting|
 
 ==============================================================================
 1. Introduction                                            *ai-introduction*
@@ -56,7 +57,7 @@ never requires touching the orchestrator.
 
   - `curl` must be installed and on `$PATH`. The plugin refuses to load
     (with an |:echoerr|) if it isn't found.
-  - Vim with |vim9script| support.
+  - Vim 9.1 or later with |vim9script| support.
   - At least one provider configured with credentials:
       - Gemini:  `$GOOGLE_API_KEY` environment variable
       - Claude:  `$ANTHROPIC_API_KEY` environment variable
@@ -135,8 +136,8 @@ the current line - the common case is a visual selection, e.g. `:'<,'>`.
 
                                                                *:AIReviewFile*
 :AIReviewFile           Same as |:AIReview|, but reviews the entire current
-                        file rather than a selection. Errors if the file
-                        is empty or the buffer is `nofile`.
+                        file rather than a selection. Errors if the buffer
+                        is `nofile`.
 
 ------------------------------------------------------------------------------
 4.3 Chat sessions                                            *ai-chat-cmds*
@@ -145,9 +146,9 @@ See also |ai-chat| for the full session-lifecycle explanation.
 
                                                                      *:AIChat*
 :AIChat                 Open a new persistent chat buffer (markdown,
-                        backed by a file under |g:ai_chat_dir|). Type your
-                        question under the `## You` heading, then run
-                        |:AIChatSend|.
+                        backed by a file under |g:vimgem_chat_home|).
+                        Type your question under the `## You` heading,
+                        then run |:AIChatSend|.
 
                                                                  *:AIChatSend*
 :[range]AIChatSend      Send the new text since the last `## You` marker
@@ -192,6 +193,16 @@ See also |ai-chat| for the full session-lifecycle explanation.
                         this from |:AIChatHistory|), or it errors out.
                         Refreshes the history listing in place afterward.
 
+                                                              *:AIChatDisplay*
+:[range]AIChatDisplay   Render the chat session's `.md` transcript to HTML
+                        and open it in the OS default browser. Session is
+                        resolved in order: (1) a valid session id on the
+                        current line from |:AIChatHistory|, (2) the
+                        current chat buffer's own `b:ai_chat_id`, (3) the
+                        most recently modified saved session. Uses
+                        `open` (macOS), `cmd.exe /c start` (Windows), or
+                        `xdg-open` / `wslview` (Linux/WSL).
+
 ------------------------------------------------------------------------------
 4.4 Models and info                                          *ai-models-info*
 
@@ -223,12 +234,6 @@ See also |ai-chat| for the full session-lifecycle explanation.
 ------------------------------------------------------------------------------
 4.5 Settings                                              *ai-settings-cmds*
 
-                                                                    *:AIDebug*
-:AIDebug [on|off]       Toggle or set debug mode. While on, every curl
-                        command is echoed via |:messages| before it runs,
-                        with API keys redacted. No argument toggles the
-                        current state.
-
                                                                    *:AIPrompt*
 :AIPrompt [on|off]      Toggle or set whether |:AIQuery|/|:AIAsk|/etc.
                         responses include the original prompt (and a
@@ -240,14 +245,13 @@ See also |ai-chat| for the full session-lifecycle explanation.
                         Get or set whether a `{=>*=}` block tagged with a
                         real filename (via a `{=<name=}` round-trip, see
                         |ai-references|) opens in a review tab instead of
-                        being written straight to disk. Unlike |:AIDebug|/
-                        |:AIPrompt|, no argument only *reports* the
-                        current value - it never toggles, since this flag
-                        is the one guard against silently clobbering files
-                        on disk. Has no effect on UNIDENTIFIED blocks
-                        (blocks with no matching `[ID: name]` tag), which
-                        always open as `[AI-output-N]` review tabs
-                        regardless of this setting.
+                        being written straight to disk. Unlike |:AIPrompt|,
+                        no argument only *reports* the current value - it
+                        never toggles, since this flag is the one guard
+                        against silently clobbering files on disk. Has no
+                        effect on UNIDENTIFIED blocks (blocks with no
+                        matching `[ID: name]` tag), which always open as
+                        `[AI-output-N]` review tabs regardless.
 
                                                                       *:AIUrl*
 :AIUrl [url]            Get or set `g:openai_base_url` (the `openai`
@@ -258,7 +262,7 @@ See also |ai-chat| for the full session-lifecycle explanation.
                                                                       *:AISet*
 :AISet [key] [value]    Generic get/set for any configurable key (model,
                         API version, API key, or base URL per provider,
-                        plus `show_prompt`/`debug`/
+                        plus `show_prompt`, `curl_trace_level`, and
                         `always_review_received_files`). Tab-completes
                         {key}.
                           - No args: list every valid key.
@@ -276,6 +280,21 @@ See also |ai-chat| for the full session-lifecycle explanation.
                         (the wrong form sets the value to the 8 literal
                         characters `"v1beta"`, quotes included, which
                         breaks the API request.)
+
+                                                                    *:DBGSet*
+:DBGSet [spec]          Configure active debug levels. {spec} is one of:
+                          - A single level: `9`
+                          - A comma-separated list: `1,2,6`
+                          - A range: `1-4`
+                          - `0` to disable all debugging
+                        No argument displays the currently active levels.
+                        See |ai-debugging| for what each level records.
+
+                                                                *:DBGShowAST*
+:DBGShowAST             Parse the current buffer as Markdown and display
+                        the resulting AST (Abstract Syntax Tree) in a new
+                        text buffer. Useful for diagnosing rendering
+                        issues in `aimd` filetype buffers.
 
 ==============================================================================
 5. Reference directives                                    *ai-references*
@@ -296,13 +315,13 @@ Register-indirected (works with |:AIAsk| and |:AIChatSend|) ~
 
                                                              *ai-ref-register*
 {='a=}                  Insert the contents of register `a into the
-                        chat/prompt stream
+                        chat/prompt stream.
 
 {=1,10<'a>=}            Send lines 1-10 of the buffer or file whose NAME
                         is stored in register `a` (yank a filename into
                         the register first). Looks for an already-open
                         buffer by exact name first, then falls back to
-                        reading the file straight off disk
+                        reading the file straight off disk.
                         Use `$` for "last line", e.g. `1,$<'a>`.
 
 Direct-name, :AIChat-only (whole-file only, no line ranges) ~
@@ -351,7 +370,7 @@ from the prompt before expansion; the model never sees plugin syntax.
 ==============================================================================
 6. Chat sessions in depth                                          *ai-chat*
 
-A chat session is two files under |g:ai_chat_dir|, sharing one
+A chat session is two files under |g:vimgem_chat_home|, sharing one
 timestamp-derived id (`chat-<id>.md` / `chat-<id>.json`):
 
   - `chat-<id>.md` - the human-readable, visible transcript. This is a
@@ -363,6 +382,11 @@ timestamp-derived id (`chat-<id>.md` / `chat-<id>.json`):
     Always written immediately and in full, regardless of
     |g:ai_chat_autosave|, since losing it silently would break context
     continuity on resume.
+  - `chat-<id>.html` - a rendered HTML sidecar, regenerated on every
+    turn (when |g:ai_chat_html_autosave| is on). Used by
+    |:AIChatDisplay| to open the chat in a browser; always regenerated
+    on demand if missing or older than the `.md` log, so chats from
+    before this feature existed are handled transparently.
 
 Each `## You` heading in the transcript carries a timestamp (marking when
 that slot opened - session start, or the previous response's arrival) and
@@ -397,10 +421,6 @@ g:show_prompt           `1` to include the original prompt (and a
                         output buffers, `0` for bare response text only.
                         Default: `1`.
 
-                                                                     *g:debug*
-g:debug                 `1` to echo every curl command (via |:messages|,
-                        API keys redacted) before running it. Default: `0`.
-
                                               *g:always_review_received_files*
 g:always_review_received_files
                         `1` (default): a `{=>*=}` block tagged with a real
@@ -410,9 +430,14 @@ g:always_review_received_files
                         effect on unidentified blocks, which always open
                         as review tabs.
 
-                                                               *g:ai_chat_dir*
-g:ai_chat_dir           Directory where |:AIChat| transcripts and history
-                        are saved. Default: `"~/.vim/ai-chat"`.
+                                                          *g:vimgem_chat_home*
+g:vimgem_chat_home      Directory where |:AIChat| transcripts, JSON
+                        histories, and rendered HTML sidecars are saved.
+                        Resolution order: `g:vimgem_chat_home` (this
+                        variable), then `$VIMGEM_CHAT_HOME` (environment),
+                        then `~/.vimgem/ai-chat` (built-in default).
+                        The directory is created automatically if it
+                        doesn't exist.
 
                                                           *g:ai_chat_autosave*
 g:ai_chat_autosave      `1` (default) to write the chat's `.md` transcript
@@ -421,9 +446,31 @@ g:ai_chat_autosave      `1` (default) to write the chat's `.md` transcript
                         affects the `.md` log; the `.json` history is
                         always written immediately regardless.
 
+                                                     *g:ai_chat_html_autosave*
+g:ai_chat_html_autosave `1` (default) to render the chat's `.html` sidecar
+                        on every turn (requires `g:ai_chat_autosave` to
+                        also be on). Set to `0` to disable for very large
+                        chats where the per-turn markdown parse becomes
+                        noticeable. |:AIChatDisplay| regenerates the HTML
+                        on demand regardless of this setting if the file
+                        is missing or stale.
+
+                                                          *g:ai_curl_trace_level*
+g:ai_curl_trace_level   Debug level at which the (secret-redacted) curl
+                        command for each API request is written to the
+                        debug log. Default: `9`. Set to a level that is
+                        active (via |:DBGSet|) to enable curl tracing.
+                        See |ai-debugging| for details.
+
+                                                           *g:ai_no_mappings*
+g:ai_no_mappings        Set to `1` in your `.vimrc` to suppress all of the
+                        plugin's default key mappings (the `\c`, `\s`,
+                        `\r`, ... bindings). Useful if you want to define
+                        your own without triggering the MapDefault guards.
+
 Gemini ~
                                                               *g:gemini_model*
-g:gemini_model          Model name. Default: `"gemini-3.1-flash-lite"`.
+g:gemini_model          Model name. Default: `"gemini-3.5-flash-lite"`.
                                                         *g:gemini_api_version*
 g:gemini_api_version    API version path segment. Default: `"v1"`.
                                                              *$GOOGLE_API_KEY*
@@ -488,7 +535,77 @@ can switch between them - mid-chat included - without the rest of the
 plugin needing to know which one is active.
 
 ==============================================================================
-9. Troubleshooting                                        *ai-troubleshooting*
+9. Debugging                                                *ai-debugging*
+
+vimgem has a multi-level debug logging facility. Debug output is written
+to a per-session log file (one per Vim PID) rather than echoed into Vim,
+so it never interrupts the editing workflow.
+
+Log file location ~
+
+        `~/.vimgem/log/debug_<PID>.log`
+
+        The `~/.vimgem/log/` directory must exist for logging to work;
+        the plugin does NOT create it automatically. Create it once:
+>
+            mkdir -p ~/.vimgem/log
+<
+:DBGSet [spec]          Set which debug levels are active. {spec} examples:
+>
+            :DBGSet 1        " enable level 1 only
+            :DBGSet 1,2      " enable levels 1 and 2
+            :DBGSet 1-4      " enable levels 1 through 4
+            :DBGSet 9        " enable curl trace level (see below)
+            :DBGSet 0        " disable all debug output
+            :DBGSet          " (no arg) show currently active levels
+<
+Reserved debug levels ~
+
+        Level 9     Curl trace. Each API request's full curl command is
+                    written to the log with the API key replaced by
+                    `***REDACTED***`. This is the fastest way to diagnose
+                    an API error - the raw JSON error body from the server
+                    is visible in the command's output. Controlled by
+                    |g:ai_curl_trace_level| (default 9).
+
+        Other levels are available for future use by individual modules.
+
+Two calling conventions ~
+
+        From vim9script modules, call `Util.DBG(level, fmt, ...)`:
+>
+            import './util.vim' as Util
+            Util.DBG(1, "plugin loaded, provider=%s", this.config.provider)
+<
+        Shorthand method, no import required:
+>
+            g:DBG(1, "HELLO FROM ai.vim, using g:DBG")
+<
+        Both call the same underlying `ai#util#DBG` autoload function.
+
+Reading the log ~
+
+        Find the <pid> and tail the log terminal window in default location:
+>
+            tail -f ~/.vimgem/log/debug_<pid>.log
+<
+        Or open it in Vim itself:
+>
+            :echo getpid()
+            :edit ~/.vimgem/log
+<
+        This will show all the logs in the log directory, look for pid and hit
+        RETURN.
+
+:DBGShowAST             Parse the current buffer's content as Markdown
+                        using the internal MdParser and display the
+                        resulting AST as a flat text listing in a new
+                        `nofile` buffer. Useful for diagnosing `aimd`
+                        syntax-highlighting issues when the rendered
+                        output doesn't look right.
+
+==============================================================================
+10. Troubleshooting                                       *ai-troubleshooting*
 
 "vim-ai-plugin requires curl to be installed" ~
         `curl` isn't on `$PATH`. Install it; the plugin does nothing
@@ -510,9 +627,23 @@ provider is '<other>'." ~
         flagged, since custom/local model names can't always be
         predicted correctly.
 
-Turn debug mode on with |:AIDebug| to see the exact (secret-redacted)
-curl command for any request, which is usually the fastest way to
-diagnose an API error.
+Debug logging produces no output ~
+        Check that `~/.vimgem/log/` exists (`mkdir -p ~/.vimgem/log`),
+        and that at least one debug level is active (`:DBGSet` with no
+        args shows the current levels). Level 1 is on by default at
+        startup; if you've run `:DBGSet 0`, re-enable with `:DBGSet 1`.
+
+Curl errors / API errors ~
+        Run `:DBGSet 9` to enable curl tracing, then retry the failing
+        command. The exact (secret-redacted) curl command and the raw
+        server response appear in the debug log - see |ai-debugging| for
+        how to find and read it.
+
+MaybeRenderHtml errors silently swallowed ~
+        HTML rendering errors are caught and suppressed so a malformed
+        line in the transcript can't abort an autosave mid-chat. Enable
+        debug level 1 to see them: the error and the chat-id are logged
+        via `Util.DBG('MaybeRenderHtml: ...')`.
 
 ==============================================================================
 vim:tw=78:ts=8:ft=help:norl:

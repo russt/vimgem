@@ -10,6 +10,20 @@ vim9script
 # file plus config.vim (for the AIConfig type), provider.vim (for the
 # interface it implements) and util.vim (for RedactSecret/StripChatArtifacts).
 # None of the Gemini/Claude provider code is needed.
+#
+# Per-chat model is read from the ChatSessionInfo registry via
+# this.config.GetChatSessionModel(chat_id). When chat_id is ''
+# (one-shot commands: :AIQuery, :AIExplain, :AIReview, :AIReviewFile),
+# the provider falls back to this.config.openai_model.
+# api_version is not used by the OpenAI protocol (the version is
+# encoded in the URL path /v1/...) so GetChatSessionApiVersion is not
+# consulted here.
+#
+# This provider never writes to this.config. Model and provider
+# selection are config/session concerns managed by AIPlugin (core.vim).
+#
+# GenerateContent and GenerateChat return dict<any> - see provider.vim
+# for the return value convention.
 
 import './config.vim' as Cfg
 import './provider.vim' as Provider
@@ -24,11 +38,11 @@ export class OpenAIProvider extends Provider.AIProvider
         # A base_url is required; an API key is not (most local servers
         # ignore auth entirely), so we don't check for one here.
         # A model doesn't need to be USER-set: when empty, the "model"
-        # field is omitted from the request entirely (see GenerateContent),
+        # field is omitted from the request entirely (see ExecuteChatRequest),
         # which matches the official mlx_lm.server's own example requests
         # and works fine for most single-model local servers. Only
         # multi-model servers (Ollama, vLLM, api.openai.com) need the real
-        # name, via g:openai_model / :AISetModel.
+        # name, via g:openai_model / :AIModel.
         return !empty(this.config.openai_base_url)
     enddef
 
@@ -36,26 +50,16 @@ export class OpenAIProvider extends Provider.AIProvider
         return "Error: g:openai_base_url is not set."
     enddef
 
-    def GetCurrentModel(): string
+    # Returns the global default model for display purposes (:AIInfo,
+    # :AIModels, confirmation messages). Not the per-chat model.
+    def GetDefaultModel(): string
         return this.config.openai_model
-    enddef
-
-    def SetModel(model: string)
-        this.config.openai_model = model
-        g:openai_model = model
-    enddef
-
-    def RefreshDefaults()
-        if empty(this.config.openai_model)
-            this.config.openai_model = get(g:, 'openai_model', Cfg.PROVIDER_MODEL_DEFAULTS.openai)
-        endif
-        this.config.openai_api_key = get(g:, 'openai_api_key', $OPENAI_API_KEY)
     enddef
 
     def GetStatusLines(): list<string>
         return [
             $'  Base URL: {this.config.openai_base_url}',
-            $'  Model: {empty(this.config.openai_model) ? "(not set - no model field sent; server uses whatever it was launched with)" : this.config.openai_model}',
+            $'  Model (default): {empty(this.config.openai_model) ? "(not set - no model field sent; server uses whatever it was launched with)" : this.config.openai_model}',
             $'  API Key: {!empty(this.config.openai_api_key) ? "Set" : "Not set (ok for most local servers)"}',
         ]
     enddef
@@ -63,7 +67,7 @@ export class OpenAIProvider extends Provider.AIProvider
     def GetConfigLines(): list<string>
         return [
             '  let g:openai_base_url = "http://localhost:9090"  # or "https://api.openai.com"',
-            '  let g:openai_model = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"  # only needed for multi-model servers (Ollama, vLLM, api.openai.com) - leave unset for single-model servers',
+            '  let g:openai_model = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"  # only needed for multi-model servers',
             '  let g:openai_api_key = ""  # optional, most local servers ignore it',
         ]
     enddef
@@ -92,9 +96,7 @@ export class OpenAIProvider extends Provider.AIProvider
 
         curl_cmd ..= ' ' .. shellescape(url)
 
-        if this.config.debug
-            echom '[AI debug] ' .. Util.RedactSecret(curl_cmd, this.config.openai_api_key)
-        endif
+        g:DBG(this.config.curl_trace_level, '[AI debug] %s', Util.RedactSecret(curl_cmd, this.config.openai_api_key))
 
         var response = system(curl_cmd)
         var exit_code = v:shell_error
@@ -145,25 +147,40 @@ export class OpenAIProvider extends Provider.AIProvider
         return output
     enddef
 
-    def GenerateContent(prompt: string): string
+    # Resolve model for this call. OpenAI protocol does not have a
+    # separate api_version field (the version is in the URL path /v1/).
+    # When chat_id is non-empty, read from the per-chat session snapshot;
+    # otherwise fall back to global config.
+    def ResolveModel(chat_id: string): string
+        if !empty(chat_id)
+            var m = this.config.GetChatSessionModel(chat_id)
+            return !empty(m) ? m : this.config.openai_model
+        endif
+        return this.config.openai_model
+    enddef
+
+    def GenerateContent(prompt: string, chat_id: string): dict<any>
         if !this.IsValid()
-            return this.GetAPIKeyError()
+            return {ok: false, error: this.GetAPIKeyError()}
         endif
 
+        var model = this.ResolveModel(chat_id)
         var payload_dict: dict<any> = {
             messages: [{
                 role: 'user',
                 content: prompt
             }]
         }
-        var result = this.ExecuteChatRequest(payload_dict)
+        var result = this.ExecuteChatRequest(payload_dict, model)
         return this.ExtractResult(result)
     enddef
 
-    def GenerateChat(messages: list<dict<string>>): string
+    def GenerateChat(messages: list<dict<string>>, chat_id: string): dict<any>
         if !this.IsValid()
-            return this.GetAPIKeyError()
+            return {ok: false, error: this.GetAPIKeyError()}
         endif
+
+        var model = this.ResolveModel(chat_id)
 
         # OpenAI-compatible APIs already use 'user'/'assistant' directly.
         var api_messages = []
@@ -172,30 +189,36 @@ export class OpenAIProvider extends Provider.AIProvider
         endfor
 
         var payload_dict: dict<any> = {messages: api_messages}
-        var result = this.ExecuteChatRequest(payload_dict)
+        var result = this.ExecuteChatRequest(payload_dict, model)
         return this.ExtractResult(result)
     enddef
 
     # Shared request path for GenerateContent and GenerateChat - only the
-    # "messages" entry differs between them.
-    def ExecuteChatRequest(payload_dict: dict<any>): dict<any>
+    # "messages" entry differs between them. model is passed explicitly
+    # (already resolved from the session registry or global config by the
+    # caller) rather than re-reading from config here.
+    def ExecuteChatRequest(payload_dict: dict<any>, model: string): dict<any>
         var url = this.BuildURL('chat/completions')
         var dict_copy = copy(payload_dict)
-        # Only include "model" if the user actually set one. Omitting it
-        # entirely matches the official mlx_lm.server's own example
-        # requests, and avoids servers that try to fetch/load whatever
-        # name you give them if it isn't already loaded.
-        if !empty(this.config.openai_model)
-            dict_copy.model = this.config.openai_model
+        # Only include "model" if one is set. Omitting it entirely matches
+        # the official mlx_lm.server's own example requests, and avoids
+        # servers that try to fetch/load whatever name you give them if it
+        # isn't already loaded.
+        if !empty(model)
+            dict_copy.model = model
         endif
         var payload = json_encode(dict_copy)
         return this.ExecuteCurl(url, 'POST', payload)
     enddef
 
     # Shared response handling for GenerateContent and GenerateChat.
-    def ExtractResult(result: dict<any>): string
+    # Returns dict<any> - see provider.vim for the return value convention.
+    # The OpenAI protocol does not expose a reliable truncation signal
+    # equivalent to Claude's stop_reason; finish_reason == 'length'
+    # indicates the output was cut at the token limit.
+    def ExtractResult(result: dict<any>): dict<any>
         if has_key(result, 'error')
-            return $"Error: {result.error}"
+            return {ok: false, error: $"Error: {result.error}"}
         endif
 
         var json_response = result.data
@@ -204,16 +227,21 @@ export class OpenAIProvider extends Provider.AIProvider
             var error_msg = type(json_response.error) == v:t_dict
                         ? get(json_response.error, 'message', 'Unknown error')
                         : json_response.error
-            return $"API Error: {error_msg}"
+            return {ok: false, error: $"API Error: {error_msg}"}
         endif
 
         if has_key(json_response, 'choices') && !empty(json_response.choices)
             var choice = json_response.choices[0]
             if has_key(choice, 'message') && has_key(choice.message, 'content')
-                return Util.StripChatArtifacts(choice.message.content)
+                var text = Util.StripChatArtifacts(choice.message.content)
+                var finish_reason = get(choice, 'finish_reason', '')
+                if finish_reason == 'length'
+                    return {ok: true, text: text, truncated: true}
+                endif
+                return {ok: true, text: text}
             endif
         endif
 
-        return "Error: Received an empty or malformed response from the API."
+        return {ok: false, error: "Error: Received an empty or malformed response from the API."}
     enddef
 endclass
